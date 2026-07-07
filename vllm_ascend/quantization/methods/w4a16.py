@@ -22,13 +22,14 @@ from typing import Any
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.model_executor.parameter import permute_param_layout_
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
-from .base import AscendMoEScheme, QuantType, get_moe_num_logical_experts
+from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
 
 
@@ -37,6 +38,8 @@ def unpack_from_int32(
     shape: torch.Size,
     num_bits: int,
     packed_dim: int = 1,
+    signed: bool = True,
+    reverse_packed_order: bool = False,
 ) -> torch.Tensor:
     """Unpacks quantized weights from int32 format back to original bits.
 
@@ -44,7 +47,14 @@ def unpack_from_int32(
     :param shape: Original shape to restore, defaults to None
     :param num_bits: The number of bits used for quantization (<= 8)
     :param packed_dim: Dimension along which weights are packed (0 or 1), defaults to 1
-    :return: Unpacked tensor with int8 dtype after applying offset correction
+    :param signed: Whether to convert unsigned storage values to signed values
+        by subtracting ``2 ** (num_bits - 1)``. Keep this enabled for existing
+        W4A16 MoE, but dense Ascend weight-only matmul follows the W4A8-style
+        path and keeps the unsigned 4-bit storage values before NPU packing.
+    :param reverse_packed_order: Whether values within each packed int32 are
+        stored in reverse logical order. Dense W4A16 uses this to test the
+        compressed-tensors packing order against Ascend's int4pack conversion.
+    :return: Unpacked tensor with int8 dtype
     """
     assert weight.dtype == torch.int32, f"Expecting `weight.dtype` is torch.int32 but got {weight.dtype}."
     assert num_bits > 0, f"Expecting `num_bits` should be positive but got {num_bits}."
@@ -62,7 +72,8 @@ def unpack_from_int32(
             dtype=torch.int32,
         )
         for i in range(pack_factor):
-            unpacked_weight[:, i::pack_factor] = (weight >> (num_bits * i)) & mask
+            logical_i = pack_factor - 1 - i if reverse_packed_order else i
+            unpacked_weight[:, logical_i::pack_factor] = (weight >> (num_bits * i)) & mask
         original_row_size = int(shape[1])
         unpacked_weight = unpacked_weight[:, :original_row_size]
     else:
@@ -72,12 +83,15 @@ def unpack_from_int32(
             dtype=torch.int32,
         )
         for i in range(pack_factor):
-            unpacked_weight[i::pack_factor, :] = (weight >> (num_bits * i)) & mask
+            logical_i = pack_factor - 1 - i if reverse_packed_order else i
+            unpacked_weight[logical_i::pack_factor, :] = (weight >> (num_bits * i)) & mask
         original_row_size = int(shape[0])
         unpacked_weight = unpacked_weight[:original_row_size, :]
 
-    offset = pow(2, num_bits) // 2
-    unpacked_weight = (unpacked_weight - offset).to(torch.int8)
+    if signed:
+        offset = pow(2, num_bits) // 2
+        unpacked_weight = unpacked_weight - offset
+    unpacked_weight = unpacked_weight.to(torch.int8)
 
     return unpacked_weight
 
@@ -106,6 +120,100 @@ def pack_to_int32(weight: torch.Tensor) -> torch.Tensor:
         packed_weight = weight.view(torch.int32).contiguous()
 
     return packed_weight
+
+
+@register_scheme("W4A16", "linear")
+class AscendW4A16LinearMethod(AscendLinearScheme):
+    """Linear method for Ascend W4A16.
+
+    This method loads LLM-Compressor compressed-tensors W4A16 linear
+    checkpoints. Checkpoints store ``weight_packed`` as int32 values with
+    eight int4 weights per element and ``weight_scale`` as per-group
+    dequantization scales in ``[output_size, input_size // group_size]``.
+    During post-load processing, the weights are unpacked, transposed to the
+    Ascend operator layout, and packed again with
+    ``torch_npu.npu_convert_weight_to_int4pack``.
+    """
+
+    quant_type: QuantType = QuantType.W4A16
+
+    def __init__(self) -> None:
+        self.num_bits = 4
+        self.pack_factor = 8
+
+        vllm_config = get_current_vllm_config()
+        self.group_size = vllm_config.quant_config.quant_description.get("group_size", 128)
+        assert self.group_size > 0, "W4A16 linear requires positive group_size."
+
+    def get_weight(
+        self,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        assert input_size % self.pack_factor == 0, (
+            f"Expecting `input_size` {input_size} can be divided by "
+            f"`pack_factor` {self.pack_factor}"
+        )
+
+        return {
+            "weight_packed": torch.empty(output_size, input_size // self.pack_factor, dtype=torch.int32),
+            "weight_shape": torch.empty(2, dtype=torch.int64),
+            "_packed_dim": 1,
+            "_packed_factor": self.pack_factor,
+            "_unsharded_params": {"weight_shape"},
+        }
+
+    def get_pergroup_param(
+        self,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        layer_type: str | None = None,
+    ) -> dict[str, Any]:
+        assert input_size % self.group_size == 0, (
+            f"Expecting `input_size` {input_size} can be divided by "
+            f"`group_size` {self.group_size}"
+        )
+
+        return {
+            "weight_scale": torch.empty(output_size, input_size // self.group_size, dtype=params_dtype),
+        }
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        tp_rank: int | None = 0,
+    ) -> torch.Tensor:
+        return torch_npu.npu_weight_quant_batchmatmul(
+            x=x,
+            weight=layer.weight_packed,
+            antiquant_scale=layer.weight_scale.to(x.dtype),
+            antiquant_group_size=self.group_size,
+            bias=bias,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        permute_param_layout_(layer.weight_packed, input_dim=1, output_dim=0, packed_dim=1)
+        permute_param_layout_(layer.weight_scale, input_dim=1, output_dim=0)
+
+        packed_weight = layer.weight_packed.data
+        if hasattr(layer, "weight_shape"):
+            original_shape = torch.Size([int(dim) for dim in layer.weight_shape.data.tolist()])
+        else:
+            original_shape = torch.Size([packed_weight.shape[0], packed_weight.shape[1] * self.pack_factor])
+
+        unpacked_weight = unpack_from_int32(
+            packed_weight,
+            original_shape,
+            self.num_bits,
+            signed=True,
+        )
+        transposed_weight = unpacked_weight.transpose(0, 1).contiguous().to(torch.int32)
+        layer.weight_packed.data = torch_npu.npu_convert_weight_to_int4pack(transposed_weight)
+        layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1).contiguous()
 
 
 @register_scheme("W4A16", "moe")

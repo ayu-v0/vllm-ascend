@@ -24,14 +24,19 @@ from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, FusedMoeWei
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.linear import LinearMethodBase, RowParallelLinear
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-from vllm.model_executor.parameter import PerTensorScaleParameter
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    GroupQuantScaleParameter,
+    PackedvLLMParameter,
+    PerTensorScaleParameter,
+)
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_flashcomm2_otp_group, get_mlp_tp_group, get_otp_group
 from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable, mlp_tp_enable, oproj_tp_enable
 
-from .methods import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, is_mx_quant_type
+from .methods import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, QuantType, is_mx_quant_type
 
 
 class AscendLinearMethod(LinearMethodBase):
@@ -66,17 +71,39 @@ class AscendLinearMethod(LinearMethodBase):
         # Extract packing information (if present)
         packed_dim = weight_dict.pop("_packed_dim", None)
         packed_factor = weight_dict.pop("_packed_factor", None)
+        unsharded_params = weight_dict.pop("_unsharded_params", set())
+        is_w4a16 = getattr(self.quant_method, "quant_type", None) == QuantType.W4A16
 
         for weight_name, weight_param in weight_dict.items():
-            param = torch.nn.Parameter(weight_param, requires_grad=False)
-            set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
+            if is_w4a16 and weight_name == "weight_packed":
+                assert packed_dim is not None and packed_factor is not None
+                param = PackedvLLMParameter(
+                    data=weight_param,
+                    input_dim=1,
+                    output_dim=0,
+                    packed_dim=packed_dim,
+                    packed_factor=packed_factor,
+                    weight_loader=weight_loader,
+                )
+            elif is_w4a16 and weight_name == "weight_shape":
+                param = BasevLLMParameter(data=weight_param, weight_loader=weight_loader)
+                param.ignore_warning = True
+            else:
+                param = torch.nn.Parameter(weight_param, requires_grad=False)
+                if weight_name not in unsharded_params:
+                    set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
 
-            # Set packing attributes if the weight is packed
-            if packed_dim is not None and packed_factor is not None:
-                set_weight_attrs(param, {"packed_dim": packed_dim, "packed_factor": packed_factor})
+                # Set packing attributes if the weight is packed
+                if (
+                    weight_name not in unsharded_params
+                    and packed_dim is not None
+                    and packed_factor is not None
+                ):
+                    set_weight_attrs(param, {"packed_dim": packed_dim, "packed_factor": packed_factor})
 
             layer.register_parameter(weight_name, param)
-            set_weight_attrs(param, extra_weight_attrs)
+            if not isinstance(param, BasevLLMParameter):
+                set_weight_attrs(param, extra_weight_attrs)
 
         # NOTE: In flatquant quantization implementation,
         # the shape of pertensor_param requires introducing layer_type
@@ -106,16 +133,25 @@ class AscendLinearMethod(LinearMethodBase):
             input_size_per_partition, output_size_per_partition, params_dtype, layer_type=layer_type
         )
         for pergroup_name, pergroup_param in pergroup_dict.items():
-            param = torch.nn.Parameter(pergroup_param, requires_grad=False)
-            set_weight_attrs(param, {"output_dim": 0})
+            if is_w4a16 and pergroup_name == "weight_scale":
+                param = GroupQuantScaleParameter(
+                    data=pergroup_param,
+                    output_dim=0,
+                    input_dim=1,
+                    weight_loader=weight_loader,
+                )
+            else:
+                param = torch.nn.Parameter(pergroup_param, requires_grad=False)
+                set_weight_attrs(param, {"output_dim": 0})
+                set_weight_attrs(param, extra_weight_attrs)
+                if (
+                    "weight_scale_second" in pergroup_name
+                    or "weight_offset_second" in pergroup_name
+                    or is_mx_quant_type(self.quant_method)
+                    or getattr(self.quant_method, "quant_type", None) == QuantType.W4A16
+                ):
+                    param.input_dim = 1
             layer.register_parameter(pergroup_name, param)
-            set_weight_attrs(param, extra_weight_attrs)
-            if (
-                "weight_scale_second" in pergroup_name
-                or "weight_offset_second" in pergroup_name
-                or is_mx_quant_type(self.quant_method)
-            ):
-                param.input_dim = 1
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if hasattr(self.quant_method, "process_weights_after_loading"):

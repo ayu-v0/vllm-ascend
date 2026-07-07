@@ -5,7 +5,12 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_forward_context import MoECommType
-from vllm_ascend.quantization.methods.w4a16 import AscendW4A16FusedMoEMethod, pack_to_int32, unpack_from_int32
+from vllm_ascend.quantization.methods.w4a16 import (
+    AscendW4A16FusedMoEMethod,
+    AscendW4A16LinearMethod,
+    pack_to_int32,
+    unpack_from_int32,
+)
 
 
 class TestUnpackFromInt32(TestBase):
@@ -18,6 +23,33 @@ class TestUnpackFromInt32(TestBase):
         self.assertEqual(result.dtype, torch.int8)
         self.assertEqual(result.shape, shape)
         self.assertTrue(torch.equal(result, torch.tensor([[-8, -7, -6, -5, -4, -3]], dtype=torch.int8)))
+
+    def test_unpack_from_int32_unsigned_keeps_storage_values(self):
+        weight = torch.tensor([[0x76543210]], dtype=torch.int32)
+        shape = torch.Size([1, 6])
+
+        result = unpack_from_int32(weight, shape, num_bits=4, packed_dim=1, signed=False)
+
+        self.assertEqual(result.dtype, torch.int8)
+        self.assertEqual(result.shape, shape)
+        self.assertTrue(torch.equal(result, torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.int8)))
+
+    def test_unpack_from_int32_reverse_packed_order(self):
+        weight = torch.tensor([[0x76543210]], dtype=torch.int32)
+        shape = torch.Size([1, 6])
+
+        result = unpack_from_int32(
+            weight,
+            shape,
+            num_bits=4,
+            packed_dim=1,
+            signed=False,
+            reverse_packed_order=True,
+        )
+
+        self.assertEqual(result.dtype, torch.int8)
+        self.assertEqual(result.shape, shape)
+        self.assertTrue(torch.equal(result, torch.tensor([[7, 6, 5, 4, 3, 2]], dtype=torch.int8)))
 
     def test_unpack_from_int32_packed_dim_1(self):
         weight = torch.tensor([[305419896, -1420531520]], dtype=torch.int32)
@@ -141,6 +173,110 @@ class TestPackToInt32(TestBase):
 
         with self.assertRaisesRegex(AssertionError, re.escape(message)):
             pack_to_int32(weight)
+
+
+class TestAscendW4A16LinearMethod(TestBase):
+    input_size = 128
+    output_size = 64
+    group_size = 32
+
+    @patch("vllm_ascend.quantization.methods.w4a16.get_current_vllm_config")
+    def setUp(self, mock_get_current_vllm_config):
+        mock_vllm_config = Mock()
+        mock_vllm_config.quant_config = Mock(
+            quant_description={
+                "group_size": self.group_size,
+            }
+        )
+        mock_get_current_vllm_config.return_value = mock_vllm_config
+
+        self.quant_method = AscendW4A16LinearMethod()
+
+    def test_get_weight(self):
+        param_dict = self.quant_method.get_weight(self.input_size, self.output_size, torch.bfloat16)
+
+        self.assertEqual(param_dict["weight_packed"].dtype, torch.int32)
+        self.assertEqual(
+            param_dict["weight_packed"].shape,
+            torch.Size([self.output_size, self.input_size // self.quant_method.pack_factor]),
+        )
+        self.assertEqual(param_dict["weight_shape"].dtype, torch.int64)
+        self.assertEqual(param_dict["weight_shape"].shape, torch.Size([2]))
+        self.assertEqual(param_dict["_packed_dim"], 1)
+        self.assertEqual(param_dict["_packed_factor"], self.quant_method.pack_factor)
+        self.assertEqual(param_dict["_unsharded_params"], {"weight_shape"})
+
+    def test_get_weight_assertion_input_size_message(self):
+        message = "Expecting `input_size` 129 can be divided by `pack_factor` 8"
+
+        with self.assertRaisesRegex(AssertionError, re.escape(message)):
+            self.quant_method.get_weight(self.input_size + 1, self.output_size, torch.bfloat16)
+
+    def test_get_pergroup_param(self):
+        param_dict = self.quant_method.get_pergroup_param(self.input_size, self.output_size, torch.bfloat16)
+
+        self.assertEqual(param_dict["weight_scale"].dtype, torch.bfloat16)
+        self.assertEqual(
+            param_dict["weight_scale"].shape,
+            torch.Size([self.output_size, self.input_size // self.group_size]),
+        )
+
+    def test_get_pergroup_param_assertion_input_size_message(self):
+        message = "Expecting `input_size` 129 can be divided by `group_size` 32"
+
+        with self.assertRaisesRegex(AssertionError, re.escape(message)):
+            self.quant_method.get_pergroup_param(self.input_size + 1, self.output_size, torch.bfloat16)
+
+    @patch("vllm_ascend.quantization.methods.w4a16.torch_npu.npu_weight_quant_batchmatmul")
+    def test_apply_uses_weight_only_antiquant_matmul(self, mock_weight_quant_batchmatmul):
+        layer = Mock()
+        layer.weight_packed = torch.empty(
+            self.input_size, self.output_size // self.quant_method.pack_factor, dtype=torch.int32
+        )
+        layer.weight_scale = torch.empty(self.input_size // self.group_size, self.output_size)
+        layer.weight_offset = torch.zeros(self.input_size // self.group_size, self.output_size)
+        x = torch.empty(2, self.input_size, dtype=torch.bfloat16)
+        bias = torch.empty(self.output_size, dtype=torch.bfloat16)
+        output = torch.empty(2, self.output_size, dtype=torch.bfloat16)
+        mock_weight_quant_batchmatmul.return_value = output
+
+        result = self.quant_method.apply(layer, x, bias)
+
+        self.assertIs(result, output)
+        mock_weight_quant_batchmatmul.assert_called_once()
+        kwargs = mock_weight_quant_batchmatmul.call_args.kwargs
+        self.assertIs(kwargs["x"], x)
+        self.assertIs(kwargs["weight"], layer.weight_packed)
+        self.assertNotIn("antiquant_offset", kwargs)
+        self.assertEqual(kwargs["antiquant_group_size"], self.group_size)
+        self.assertIs(kwargs["bias"], bias)
+
+    @patch("vllm_ascend.quantization.methods.w4a16.permute_param_layout_")
+    @patch("vllm_ascend.quantization.methods.w4a16.torch_npu.npu_convert_weight_to_int4pack")
+    def test_process_weights_after_loading_uses_signed_dense_int4_storage(
+        self,
+        mock_npu_convert_weight_to_int4pack,
+        mock_permute_param_layout,
+    ):
+        captured = {}
+
+        def mock_convert_weight(weight):
+            captured["weight"] = weight.clone()
+            return torch.zeros((weight.shape[0], 1), dtype=torch.int32)
+
+        mock_npu_convert_weight_to_int4pack.side_effect = mock_convert_weight
+        layer = torch.nn.Module()
+        layer.weight_packed = torch.nn.Parameter(torch.tensor([[0x76543210]], dtype=torch.int32), requires_grad=False)
+        layer.weight_shape = torch.nn.Parameter(torch.tensor([1, 6], dtype=torch.int64), requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(torch.tensor([[0.25]], dtype=torch.bfloat16), requires_grad=False)
+
+        self.quant_method.process_weights_after_loading(layer)
+
+        expected = torch.tensor([[-8], [-7], [-6], [-5], [-4], [-3]], dtype=torch.int32)
+        self.assertEqual(mock_permute_param_layout.call_count, 2)
+        self.assertTrue(torch.equal(captured["weight"], expected))
+        self.assertEqual(layer.weight_scale.shape, torch.Size([1, 1]))
+        self.assertFalse(hasattr(layer, "weight_offset"))
 
 
 class TestAscendW4A16FusedMoEMethod(TestBase):

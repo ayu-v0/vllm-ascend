@@ -37,6 +37,10 @@ class TestGetSchemeClass(TestBase):
         self.assertIsNotNone(cls)
         self.assertTrue(issubclass(cls, AscendLinearScheme))
 
+        cls = get_scheme_class("W4A16", "linear")
+        self.assertIsNotNone(cls)
+        self.assertTrue(issubclass(cls, AscendLinearScheme))
+
         cls = get_scheme_class("W8A8_DYNAMIC", "moe")
         self.assertIsNotNone(cls)
         self.assertTrue(issubclass(cls, AscendMoEScheme))

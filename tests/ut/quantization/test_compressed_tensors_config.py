@@ -65,8 +65,13 @@ class TestAscendCompressedTensorsQuanType(TestBase):
         weight.strategy = "group"
         weight.dynamic = False
         weight.type = QuantizationType.INT
+        weight.symmetric = True
+        weight.group_size = 128
         result = self.config._detect_quant_type(weight, None, None)
         self.assertEqual(result, "W4A16")
+        self.assertEqual(self.config.quant_description["group_size"], 128)
+        self.assertEqual(self.config.quant_description["version"], "0")
+        self.assertEqual(self.config.quant_description["ascend_quant_method"], COMPRESSED_TENSORS_METHOD)
 
     def test_detect_unsupported_raises(self):
         weight = self._make_weight_quant(num_bits=2, strategy="channel", dynamic=False, symmetric=True)
