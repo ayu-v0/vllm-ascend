@@ -3,6 +3,11 @@ from unittest.mock import MagicMock, patch
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    GroupQuantScaleParameter,
+    PackedvLLMParameter,
+)
 
 from tests.ut.base import TestBase
 from vllm_ascend.quantization.method_adapters import (
@@ -10,7 +15,12 @@ from vllm_ascend.quantization.method_adapters import (
     AscendKVCacheMethod,
     AscendLinearMethod,
 )
-from vllm_ascend.quantization.methods.base import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme
+from vllm_ascend.quantization.methods.base import (
+    AscendAttentionScheme,
+    AscendLinearScheme,
+    AscendMoEScheme,
+    QuantType,
+)
 
 
 class TestAscendLinearMethod(TestBase):
@@ -81,6 +91,54 @@ class TestAscendLinearMethod(TestBase):
         self.mock_scheme.process_weights_after_loading.return_value = None
         self.method.process_weights_after_loading(layer)
         self.mock_scheme.process_weights_after_loading.assert_called_once_with(layer)
+
+    @patch("vllm_ascend.quantization.method_adapters.enable_dsa_cp_with_layer_shard")
+    def test_create_weights_uses_vllm_parameters_for_w4a16(self, mock_enable_dsa_cp_with_layer_shard):
+        scheme = MagicMock(spec=AscendLinearScheme)
+        scheme.quant_type = QuantType.W4A16
+        scheme.get_weight.return_value = {
+            "weight_packed": torch.empty(128, 32, dtype=torch.int32),
+            "weight_shape": torch.empty(2, dtype=torch.int64),
+            "_packed_dim": 1,
+            "_packed_factor": 8,
+            "_unsharded_params": {"weight_shape"},
+        }
+        scheme.get_pertensor_param.return_value = {}
+        scheme.get_perchannel_param.return_value = {}
+        scheme.get_pergroup_param.return_value = {
+            "weight_scale": torch.empty(128, 2, dtype=torch.bfloat16),
+        }
+        method = AscendLinearMethod(scheme)
+        layer = torch.nn.Module()
+        weight_loader = MagicMock()
+
+        method.create_weights(
+            layer,
+            input_size_per_partition=256,
+            output_partition_sizes=[128],
+            input_size=256,
+            output_size=128,
+            params_dtype=torch.bfloat16,
+            weight_loader=weight_loader,
+        )
+
+        self.assertIsInstance(layer.weight_packed, PackedvLLMParameter)
+        self.assertEqual(layer.weight_packed.input_dim, 1)
+        self.assertEqual(layer.weight_packed.output_dim, 0)
+        self.assertEqual(layer.weight_packed.packed_dim, 1)
+        self.assertEqual(layer.weight_packed.packed_factor, 8)
+        self.assertEqual(layer.weight_packed.weight_loader, weight_loader)
+
+        self.assertIsInstance(layer.weight_scale, GroupQuantScaleParameter)
+        self.assertEqual(layer.weight_scale.input_dim, 1)
+        self.assertEqual(layer.weight_scale.output_dim, 0)
+        self.assertEqual(layer.weight_scale.weight_loader, weight_loader)
+
+        self.assertIsInstance(layer.weight_shape, BasevLLMParameter)
+        self.assertTrue(layer.weight_shape.ignore_warning)
+        self.assertFalse(hasattr(layer.weight_shape, "input_dim"))
+        self.assertFalse(hasattr(layer.weight_shape, "output_dim"))
+        self.assertEqual(layer.weight_shape.weight_loader, weight_loader)
 
     def test_apply_delegates_to_scheme(self):
         layer = MagicMock(spec=ColumnParallelLinear)

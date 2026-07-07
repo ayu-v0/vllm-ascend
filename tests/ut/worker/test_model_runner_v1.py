@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
@@ -106,7 +105,6 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
             [1, 2, 3, -1],
             [4, 5, -1],
         ]
-        input_batch.sampling_metadata.top_k = None
         input_batch.num_reqs = 2
         input_batch.top_k_cpu = None
         input_batch.prev_req_id_to_index = {
@@ -150,67 +148,37 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         self.assertEqual(actual_output_token_ids[0], [1, 2, 3, 6])
         self.assertEqual(actual_output_token_ids[1], [4, 5, 7])
 
-    def test_placeholder_spec_tokens_are_sanitized_only_for_forward(self):
-        runner = self._build_runner()
-        runner.input_ids = SimpleNamespace(
-            cpu=torch.tensor([11, -1, 33, -1], dtype=torch.int32),
-            gpu=torch.tensor([11, -1, 33, -1], dtype=torch.int32),
-        )
-        scheduler_output = SimpleNamespace(
-            scheduled_spec_decode_tokens={"req0": [-1]},
-        )
 
-        runner._sanitize_placeholder_input_ids_for_forward(
-            scheduler_output,
-            num_forward_tokens=4,
-        )
+class TestNPUModelRunnerModelForward(unittest.TestCase):
+    def test_model_forward_keeps_input_ids_for_multimodal_embeds(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.model = MagicMock(return_value=torch.randn(3, 4))
+        runner.supports_mm_inputs = True
+        runner.enable_enpu = False
+        runner.input_ids = SimpleNamespace(gpu=torch.arange(8))
+        runner._update_full_graph_params_if_needed = MagicMock()
 
-        self.assertEqual(runner.input_ids.gpu.tolist(), [11, 0, 33, 0])
-        self.assertEqual(runner.input_ids.cpu.tolist(), [11, -1, 33, -1])
+        forward_context = SimpleNamespace(flash_comm_v1_enabled=False)
+        positions = torch.arange(3)
+        inputs_embeds = torch.randn(3, 4)
 
-    def test_placeholder_sanitization_is_scoped_to_current_forward(self):
-        runner = self._build_runner()
-        runner.input_ids = SimpleNamespace(
-            cpu=torch.tensor([11, -1, 33, -1], dtype=torch.int32),
-            gpu=torch.tensor([11, -1, 33, -1], dtype=torch.int32),
-        )
-        scheduler_output = SimpleNamespace(
-            scheduled_spec_decode_tokens={"req0": [-1]},
-        )
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.get_forward_context",
+            return_value=forward_context,
+        ):
+            runner._model_forward(
+                3,
+                input_ids=None,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                mm_kwargs="kept",
+            )
 
-        runner._sanitize_placeholder_input_ids_for_forward(
-            scheduler_output,
-            num_forward_tokens=2,
-        )
-
-        self.assertEqual(runner.input_ids.gpu.tolist(), [11, 0, 33, -1])
-
-    def test_mtp3_placeholder_metadata_is_preserved_before_sanitizing_forward(self):
-        runner = self._build_runner()
-        runner.pcp_size = 1
-        runner.arange_np = np.arange(8, dtype=np.int32)
-        runner._arange_scratch = np.empty(8, dtype=np.int32)
-        runner.input_ids = SimpleNamespace(
-            cpu=torch.tensor([11, -1, -1, -1], dtype=torch.int32),
-            gpu=torch.tensor([11, -1, -1, -1], dtype=torch.int32),
-        )
-        scheduler_output = SimpleNamespace(
-            scheduled_spec_decode_tokens={"req0": [-1, -1, -1]},
-        )
-
-        spec_decode_metadata = runner._calc_spec_decode_metadata(
-            num_draft_tokens=np.array([3], dtype=np.int32),
-            cu_num_scheduled_tokens=np.array([4], dtype=np.int32),
-            num_pcp_pads=None,
-        )
-        runner._sanitize_placeholder_input_ids_for_forward(
-            scheduler_output,
-            num_forward_tokens=4,
-        )
-
-        self.assertEqual(spec_decode_metadata.draft_token_ids.tolist(), [-1, -1, -1])
-        self.assertEqual(runner.input_ids.gpu.tolist(), [11, 0, 0, 0])
-        self.assertEqual(runner.input_ids.cpu.tolist(), [11, -1, -1, -1])
+        call_kwargs = runner.model.call_args.kwargs
+        torch.testing.assert_close(call_kwargs["input_ids"], torch.arange(3))
+        self.assertIs(call_kwargs["positions"], positions)
+        self.assertIs(call_kwargs["inputs_embeds"], inputs_embeds)
+        self.assertEqual(call_kwargs["mm_kwargs"], "kept")
 
 
 class TestNPUModelRunnerDebugger(unittest.TestCase):

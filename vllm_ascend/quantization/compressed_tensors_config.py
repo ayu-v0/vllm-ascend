@@ -421,8 +421,17 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
         is_4_bits = weight_quant.num_bits == 4
         is_group = weight_quant.strategy == QuantizationStrategy.GROUP.value
         is_static = not weight_quant.dynamic
+        is_symmetric = weight_quant.symmetric
 
-        return input_quant_none and is_4_bits and is_group and is_static
+        if input_quant_none and is_4_bits and is_group and is_static and is_symmetric:
+            assert self.quant_description is not None, "quant_description should not be None"
+            self.quant_description["group_size"] = weight_quant.group_size
+            self.quant_description["version"] = "0"
+            self.quant_description["ascend_quant_method"] = COMPRESSED_TENSORS_METHOD
+            self.quant_description["weight_strategy"] = str(weight_quant.strategy)
+            return True
+
+        return False
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         self.target_scheme_map = hf_to_vllm_mapper.apply_dict(self.target_scheme_map)

@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vllm-ascend \n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-06-17 08:44+0000\n"
+"POT-Creation-Date: 2026-05-06 02:14+0000\n"
 "PO-Revision-Date: 2026-01-22 16:25+0800\n"
 "Last-Translator: Gemini\n"
 "Language: zh_CN\n"
@@ -38,8 +38,10 @@ msgid ""
 "backend—such as NFS, 3FS, or enterprise-grade storage—serves as the "
 "persistent KV store."
 msgstr ""
-"统一缓存管理器（UCM）为vLLM/vLLM-"
-"Ascend中的前缀缓存场景提供外部KV缓存存储层。与仅通过聚合设备内存扩展前缀缓存容量、因此仍受HBM/DRAM大小限制且缺乏持久性的KV池化不同，UCM将计算与存储解耦，采用分层设计。每个节点使用本地DRAM作为快速缓存，而共享后端（如NFS、3FS或企业级存储）则作为持久化KV存储。"
+"统一缓存管理器（UCM）为vLLM/vLLM-Ascend中的前缀缓存场景提供外部KV缓存存储层。"
+"与仅通过聚合设备内存扩展前缀缓存容量、因此仍受HBM/DRAM大小限制且缺乏持久性的"
+"KV池化不同，UCM将计算与存储解耦，采用分层设计。每个节点使用本地DRAM作为快速缓存，"
+"而共享后端（如NFS、3FS或企业级存储）则作为持久化KV存储。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:7
 msgid "**Key benefits of using UCM:**"
@@ -51,7 +53,9 @@ msgid ""
 "constrained by HBM/DRAM size. UCM removes this ceiling by offloading KV "
 "cache to external storage, enabling cache capacity to scale with the "
 "storage system rather than with compute resources."
-msgstr "**突破设备内存容量限制**：传统前缀缓存受限于HBM/DRAM大小。UCM通过将KV缓存卸载到外部存储来消除这一上限，使缓存容量随存储系统而非计算资源扩展。"
+msgstr ""
+"**突破设备内存容量限制**：传统前缀缓存受限于HBM/DRAM大小。UCM通过将KV缓存卸载到"
+"外部存储来消除这一上限，使缓存容量随存储系统而非计算资源扩展。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:11
 msgid ""
@@ -59,7 +63,9 @@ msgid ""
 "storage, ensuring that cached prefix blocks survive across service "
 "restarts, instance failures, or scheduling migrations. This is critical "
 "for production-grade inference systems."
-msgstr "**持久可靠的KV缓存**：UCM提供持久的KV缓存存储，确保缓存的prefix块在服务重启、实例故障或调度迁移后仍然存活。这对生产级推理系统至关重要。"
+msgstr ""
+"**持久可靠的KV缓存**：UCM提供持久的KV缓存存储，确保缓存的prefix块在服务重启、"
+"实例故障或调度迁移后仍然存活。这对生产级推理系统至关重要。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:13
 msgid ""
@@ -69,7 +75,10 @@ msgid ""
 "Additionally, UCM provides PD disaggregation solutions based on storage-"
 "compute separation architecture, enabling flexible management of "
 "heterogeneous computing resources."
-msgstr "**多场景加速**：UCM不仅支持前缀缓存，还提供免训练的稀疏注意力方法（如GSA、CacheBlend）用于处理超长序列推理任务。此外，UCM基于存算分离架构提供PD分离解决方案，实现异构计算资源的灵活管理。"
+msgstr ""
+"**多场景加速**：UCM不仅支持前缀缓存，还提供免训练的稀疏注意力方法（如GSA、"
+"CacheBlend）用于处理超长序列推理任务。此外，UCM基于存算分离架构提供PD分离"
+"解决方案，实现异构计算资源的灵活管理。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:15
 msgid ""
@@ -78,7 +87,9 @@ msgid ""
 "scenarios, including multi-turn dialogue and long-context reasoning "
 "tasks. Benchmarks show up to **8x improvement in TTFT** for prefix "
 "caching scenarios."
-msgstr "**显著性能提升**：与vLLM集成后，UCM在多轮对话和长上下文推理等多种场景下实现**3-10倍**推理延迟降低。基准测试显示，在前缀缓存场景中TTFT提升高达**8倍**。"
+msgstr ""
+"**显著性能提升**：与vLLM集成后，UCM在多轮对话和长上下文推理等多种场景下实现"
+"**3-10倍**推理延迟降低。基准测试显示，在前缀缓存场景中TTFT提升高达**8倍**。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:17
 msgid "How UCM Works"
@@ -208,8 +219,8 @@ msgid "CUDA (NVIDIA H100, H20, L40, L20)"
 msgstr "CUDA（NVIDIA H100、H20、L40、L20）"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:54
-msgid "CANN (Atlas A2 inference products, Atlas A3 inference products)"
-msgstr "CANN（Atlas A2推理产品、Atlas A3推理产品）"
+msgid "CANN (Ascend 910C, 910B)"
+msgstr "CANN（Ascend 910C、910B）"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:55
 msgid "MUSA (Mthreads S5000)"
@@ -241,8 +252,9 @@ msgid ""
 "Support Matrix](https://ucm.readthedocs.io/en/latest/user-guide/support-"
 "matrix/support_matrix.html)."
 msgstr ""
-"**注意**：有关完整和最新的支持矩阵，请参考[UCM支持矩阵](https://ucm.readthedocs.io/en/latest"
-"/user-guide/support-matrix/support_matrix.html)。"
+"**注意**：有关完整和最新的支持矩阵，请参考[UCM支持矩阵]"
+"(https://ucm.readthedocs.io/en/latest/user-guide/support-"
+"matrix/support_matrix.html)。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:66
 msgid "Deployment Guide"
@@ -336,7 +348,9 @@ msgid ""
 "and the Decode node retrieves it with high prefix cache hit rates. This "
 "approach achieves the highest degree of decoupling and simplifies "
 "scheduling logic."
-msgstr "在集中式PD分离中，KV缓存通过统一存储池传输。Prefill节点将KV缓存卸载到存储后端，Decode节点以高前缀缓存命中率检索。这种方法实现了最高程度的解耦，并简化了调度逻辑。"
+msgstr ""
+"在集中式PD分离中，KV缓存通过统一存储池传输。Prefill节点将KV缓存卸载到存储后端，"
+"Decode节点以高前缀缓存命中率检索。这种方法实现了最高程度的解耦，并简化了调度逻辑。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:92
 msgid ""
@@ -344,7 +358,9 @@ msgid ""
 "must have access to a **shared storage backend** (e.g., NFS-mounted "
 "directory or 3FS). Ensure the storage path is accessible from all nodes "
 "before proceeding."
-msgstr "**重要**：对于跨节点部署，所有Prefill和Decode节点必须能够访问**共享存储后端**（例如NFS挂载目录或3FS）。在继续之前，确保所有节点均可访问存储路径。"
+msgstr ""
+"**重要**：对于跨节点部署，所有Prefill和Decode节点必须能够访问**共享存储后端**"
+"（例如NFS挂载目录或3FS）。在继续之前，确保所有节点均可访问存储路径。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:94
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:210
@@ -356,7 +372,8 @@ msgid ""
 "Assume 2 Prefill instances on node 192.168.10.1 (ports 7800, 7801) and 2 "
 "Decode instances on node 192.168.10.2 (ports 7802, 7803), with a shared "
 "NFS storage at `/mnt/test1`."
-msgstr "假设节点192.168.10.1上有2个Prefill实例（端口7800、7801），节点192.168.10.2上有2个Decode实例（端口7802、7803），共享NFS存储位于`/mnt/test1`。"
+msgstr ""
+"假设节点192.168.10.1上有2个Prefill实例（端口7800、7801），节点192.168.10.2上有2个Decode实例（端口7802、7803），共享NFS存储位于`/mnt/test1`。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:98
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:376
@@ -368,7 +385,8 @@ msgstr "**步骤1：准备UCM配置文件**"
 msgid ""
 "Create a configuration file (e.g., `ucm_config_example.yaml`) with "
 "PipelineStore:"
-msgstr "创建包含PipelineStore的配置文件（例如`ucm_config_example.yaml`）："
+msgstr ""
+"创建包含PipelineStore的配置文件（例如`ucm_config_example.yaml`）："
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:113
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:391
@@ -381,7 +399,8 @@ msgid ""
 "**storage_backends**: The shared storage directory accessible from all "
 "nodes (e.g., NFS-mounted path or 3FS). For cross-node PD disaggregation, "
 "this must be a shared storage path."
-msgstr "**storage_backends**：所有节点可访问的共享存储目录（例如NFS挂载路径或3FS）。对于跨节点PD分离部署，此路径必须为共享存储路径。"
+msgstr ""
+"**storage_backends**：所有节点可访问的共享存储目录（例如NFS挂载路径或3FS）。对于跨节点PD分离部署，此路径必须为共享存储路径。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:117
 msgid ""
@@ -391,10 +410,7 @@ msgid ""
 "[UCM PipelineStore Documentation](https://ucm.readthedocs.io/en/latest"
 "/user-guide/prefix-cache/pipeline_store.html)."
 msgstr ""
-"**注意**：PipelineStore是UCM推荐的连接器。它串联了Cache Store（设备↔主机）和Posix "
-"Store（主机↔存储后端）以实现最佳传输性能。更多配置选项请参考[UCM "
-"PipelineStore文档](https://ucm.readthedocs.io/en/latest/user-guide/prefix-"
-"cache/pipeline_store.html)。"
+"**注意**：PipelineStore是UCM推荐的连接器。它串联了Cache Store（设备↔主机）和Posix Store（主机↔存储后端）以实现最佳传输性能。更多配置选项请参考[UCM PipelineStore文档](https://ucm.readthedocs.io/en/latest/user-guide/prefix-cache/pipeline_store.html)。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:119
 msgid "**Step 2: Run Prefill Servers**"
@@ -404,7 +420,8 @@ msgstr "**步骤2：运行Prefill服务器**"
 msgid ""
 "To start the second Prefill instance on the same node, modify `--port` "
 "(e.g., port 7801) and `ASCEND_RT_VISIBLE_DEVICES` accordingly."
-msgstr "要在同一节点上启动第二个Prefill实例，请相应修改`--port`（例如端口7801）和`ASCEND_RT_VISIBLE_DEVICES`。"
+msgstr ""
+"要在同一节点上启动第二个Prefill实例，请相应修改`--port`（例如端口7801）和`ASCEND_RT_VISIBLE_DEVICES`。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:147
 msgid "**Step 3: Run Decode Servers**"
@@ -414,7 +431,8 @@ msgstr "**步骤3：运行Decode服务器**"
 msgid ""
 "To start the second Decode instance on the same node, modify `--port` "
 "(e.g., port 7803) and `ASCEND_RT_VISIBLE_DEVICES` accordingly."
-msgstr "要在同一节点上启动第二个Decode实例，请相应修改`--port`（例如端口7803）和`ASCEND_RT_VISIBLE_DEVICES`。"
+msgstr ""
+"要在同一节点上启动第二个Decode实例，请相应修改`--port`（例如端口7803）和`ASCEND_RT_VISIBLE_DEVICES`。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:175
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:337
@@ -438,7 +456,8 @@ msgid ""
 "provides prefix cache on Prefill nodes for KV cache reuse. This mode is "
 "suitable for scenarios with homogeneous P/D nodes and lower latency "
 "requirements."
-msgstr "在P2P分布式PD分离部署中，Mooncake通过高速网络处理从Prefill节点到Decode节点的直接KV缓存传输，而UCM在Prefill节点上提供前缀缓存以实现KV缓存复用。此模式适用于同构P/D节点且延迟要求较低的场景。"
+msgstr ""
+"在P2P分布式PD分离部署中，Mooncake通过高速网络处理从Prefill节点到Decode节点的直接KV缓存传输，而UCM在Prefill节点上提供前缀缓存以实现KV缓存复用。此模式适用于同构P/D节点且延迟要求较低的场景。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:208
 msgid ""
@@ -446,14 +465,14 @@ msgid ""
 "installed Mooncake. For installation details, refer to [kvcache-"
 "ai/Mooncake](https://github.com/kvcache-ai/Mooncake)."
 msgstr ""
-"**注意**：从vLLM-Ascend 0.11.0开始，官方镜像已预装Mooncake。安装详情请参考[kvcache-"
-"ai/Mooncake](https://github.com/kvcache-ai/Mooncake)。"
+"**注意**：从vLLM-Ascend 0.11.0开始，官方镜像已预装Mooncake。安装详情请参考[kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake)。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:212
 msgid ""
 "Assume 2 Prefill instances on node 192.168.10.1 (ports 9000, 9001) and 2 "
 "Decode instances on node 192.168.10.2 (ports 9000, 9001)."
-msgstr "假设节点192.168.10.1上有2个Prefill实例（端口9000、9001），节点192.168.10.2上有2个Decode实例（端口9000、9001）。"
+msgstr ""
+"假设节点192.168.10.1上有2个Prefill实例（端口9000、9001），节点192.168.10.2上有2个Decode实例（端口9000、9001）。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:214
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:478
@@ -473,7 +492,8 @@ msgstr "在每个节点上准备`mooncake.json`："
 msgid ""
 "Also prepare a UCM configuration file (`ucm_config_example.yaml`) for "
 "prefix cache on Prefill nodes:"
-msgstr "同时为Prefill节点上的前缀缓存准备UCM配置文件（`ucm_config_example.yaml`）："
+msgstr ""
+"同时为Prefill节点上的前缀缓存准备UCM配置文件（`ucm_config_example.yaml`）："
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:251
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:395
@@ -483,9 +503,7 @@ msgid ""
 "Documentation](https://ucm.readthedocs.io/en/latest/user-guide/prefix-"
 "cache/pipeline_store.html)."
 msgstr ""
-"**注意**：更多配置选项请参考[UCM "
-"PipelineStore文档](https://ucm.readthedocs.io/en/latest/user-guide/prefix-"
-"cache/pipeline_store.html)。"
+"**注意**：更多配置选项请参考[UCM PipelineStore文档](https://ucm.readthedocs.io/en/latest/user-guide/prefix-cache/pipeline_store.html)。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:253
 msgid "**Step 2: Run Prefill Service**"
@@ -497,8 +515,7 @@ msgid ""
 "`kv_port`, and `ASCEND_RT_VISIBLE_DEVICES` for each instance (e.g., port "
 "9001 with kv_port 20002 for the second instance)."
 msgstr ""
-"要在同一节点上启动多个Prefill实例，请为每个实例修改`--port`、`kv_port`和`ASCEND_RT_VISIBLE_DEVICES`（例如第二个实例使用端口9001和kv_port"
-" 20002）。"
+"要在同一节点上启动多个Prefill实例，请为每个实例修改`--port`、`kv_port`和`ASCEND_RT_VISIBLE_DEVICES`（例如第二个实例使用端口9001和kv_port 20002）。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:302
 msgid "**Step 3: Run Decode Service**"
@@ -510,8 +527,7 @@ msgid ""
 "`kv_port`, and `ASCEND_RT_VISIBLE_DEVICES` for each instance (e.g., port "
 "9001 with kv_port 20002 for the second instance)."
 msgstr ""
-"要在同一节点上启动多个Decode实例，请为每个实例修改`--port`、`kv_port`和`ASCEND_RT_VISIBLE_DEVICES`（例如第二个实例使用端口9001和kv_port"
-" 20002）。"
+"要在同一节点上启动多个Decode实例，请为每个实例修改`--port`、`kv_port`和`ASCEND_RT_VISIBLE_DEVICES`（例如第二个实例使用端口9001和kv_port 20002）。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:366
 msgid "PD-Mixed Inference"
@@ -526,7 +542,8 @@ msgid ""
 "both phases in a unified scheduler, allowing interleaved execution: while"
 " one request is in Decode phase, another request can simultaneously "
 "undergo Prefill."
-msgstr "PD混合推理是指标准vLLM服务模式，其中不同请求的Prefill和Decode阶段在同一实例内并发处理。与将Prefill和Decode物理分离到专用实例的PD分离部署不同，PD混合在统一调度器中处理两个阶段，允许交错执行：当一个请求处于Decode阶段时，另一个请求可以同时进行Prefill。"
+msgstr ""
+"PD混合推理是指标准vLLM服务模式，其中不同请求的Prefill和Decode阶段在同一实例内并发处理。与将Prefill和Decode物理分离到专用实例的PD分离部署不同，PD混合在统一调度器中处理两个阶段，允许交错执行：当一个请求处于Decode阶段时，另一个请求可以同时进行Prefill。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:370
 msgid "UCM enhances PD-Mixed by providing persistent KV cache storage, enabling:"
@@ -548,7 +565,8 @@ msgstr "将KV缓存卸载到外部存储以降低GPU内存压力"
 msgid ""
 "**storage_backends**: Directory for KV cache storage. Can be local SSD or"
 " NFS-mounted path."
-msgstr "**storage_backends**：KV缓存存储目录。可以是本地SSD或NFS挂载路径。"
+msgstr ""
+"**storage_backends**：KV缓存存储目录。可以是本地SSD或NFS挂载路径。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:397
 msgid "**Step 2: Run PD-Mixed Service**"
@@ -567,7 +585,8 @@ msgid ""
 "After the second run, a significant reduction in TTFT should be observed "
 "due to UCM prefix cache hits. Review the vLLM logs for cache hit "
 "information:"
-msgstr "第二次运行后，由于UCM前缀缓存命中，应观察到TTFT显著降低。查看vLLM日志获取缓存命中信息："
+msgstr ""
+"第二次运行后，由于UCM前缀缓存命中，应观察到TTFT显著降低。查看vLLM日志获取缓存命中信息："
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:463
 msgid "Example: PD Disaggregation with Large Scale Expert Parallelism"
@@ -578,7 +597,8 @@ msgid ""
 "This section demonstrates PD disaggregation for MoE models with large-"
 "scale Expert Parallelism. MoE models require enabling data parallelism to"
 " distribute expert weights across multiple nodes."
-msgstr "本节演示了针对MoE模型的大规模专家并行PD分离部署。MoE模型需要启用数据并行以在多个节点间分布专家权重。"
+msgstr ""
+"本节演示了针对MoE模型的大规模专家并行PD分离部署。MoE模型需要启用数据并行以在多个节点间分布专家权重。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:467
 msgid "**Deployment Configuration:**"
@@ -588,13 +608,15 @@ msgstr "**部署配置：**"
 msgid ""
 "**Prefill Instance**: 4 nodes (192.168.10.1-4), DP4TP8 (4 DP processes, "
 "each with TP8)"
-msgstr "**Prefill实例**：4个节点（192.168.10.1-4），DP4TP8（4个DP进程，每个TP8）"
+msgstr ""
+"**Prefill实例**：4个节点（192.168.10.1-4），DP4TP8（4个DP进程，每个TP8）"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:470
 msgid ""
 "**Decode Instance**: 4 nodes (192.168.10.5-8), DP8TP4 (8 DP processes, "
 "each with TP4)"
-msgstr "**Decode实例**：4个节点（192.168.10.5-8），DP8TP4（8个DP进程，每个TP4）"
+msgstr ""
+"**Decode实例**：4个节点（192.168.10.5-8），DP8TP4（8个DP进程，每个TP4）"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:471
 msgid "**Total**: 8 Atlas 800T A2 servers with 8 Ascend 910B3 NPU cards each"
@@ -604,7 +626,8 @@ msgstr "**总计**：8台Atlas 800T A2服务器，每台配备8张Ascend 910B3 N
 msgid ""
 "**Storage**: 8 servers connected to AI storage device A800 via CE8875 "
 "switch"
-msgstr "**存储**：8台服务器通过CE8875交换机连接到AI存储设备A800"
+msgstr ""
+"**存储**：8台服务器通过CE8875交换机连接到AI存储设备A800"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:474
 msgid ""
@@ -613,8 +636,7 @@ msgid ""
 "Balancing](https://docs.vllm.ai/en/latest/serving/data_parallel_deployment"
 "/#external-load-balancing)."
 msgstr ""
-"**注意**：关于外部负载均衡数据并行，请参考vLLM官方文档：[外部负载均衡的数据并行部署](https://docs.vllm.ai/en/latest/serving/data_parallel_deployment"
-"/#external-load-balancing)。"
+"**注意**：关于外部负载均衡数据并行，请参考vLLM官方文档：[外部负载均衡的数据并行部署](https://docs.vllm.ai/en/latest/serving/data_parallel_deployment/#external-load-balancing)。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:476
 msgid "Deployment Steps"
@@ -632,13 +654,15 @@ msgstr "**步骤2：运行Prefill服务（DP4TP8）**"
 msgid ""
 "First, prepare a UCM configuration file (`ucm_config_example.yaml`) for "
 "prefix cache on Prefill nodes (192.168.10.1-4):"
-msgstr "首先，为Prefill节点（192.168.10.1-4）上的前缀缓存准备UCM配置文件（`ucm_config_example.yaml`）："
+msgstr ""
+"首先，为Prefill节点（192.168.10.1-4）上的前缀缓存准备UCM配置文件（`ucm_config_example.yaml`）："
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:519
 msgid ""
 "**storage_backends**: The shared storage directory accessible from all "
 "nodes (e.g., NFS-mounted path or 3FS)."
-msgstr "**storage_backends**：所有节点可访问的共享存储目录（例如NFS挂载路径或3FS）。"
+msgstr ""
+"**storage_backends**：所有节点可访问的共享存储目录（例如NFS挂载路径或3FS）。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:523
 msgid "Prepare `prefill.sh` on Prefill nodes (192.168.10.1-4):"
@@ -652,7 +676,8 @@ msgstr "为Prefill节点准备`run_multi_dp.sh`："
 msgid ""
 "Execute `run_multi_dp.sh` on each Prefill node (192.168.10.1-4) with "
 "appropriate `local_ip` and `dp_rank_start`:"
-msgstr "在每个Prefill节点（192.168.10.1-4）上使用适当的`local_ip`和`dp_rank_start`执行`run_multi_dp.sh`："
+msgstr ""
+"在每个Prefill节点（192.168.10.1-4）上使用适当的`local_ip`和`dp_rank_start`执行`run_multi_dp.sh`："
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:637
 msgid "192.168.10.1: `dp_rank_start=0`"
@@ -686,7 +711,8 @@ msgstr "为Decode节点准备`run_multi_dp.sh`："
 msgid ""
 "Execute `run_multi_dp.sh` on each Decode node (192.168.10.5-8) with "
 "appropriate `local_ip` and `dp_rank_start`:"
-msgstr "在每个Decode节点（192.168.10.5-8）上使用适当的`local_ip`和`dp_rank_start`执行`run_multi_dp.sh`："
+msgstr ""
+"在每个Decode节点（192.168.10.5-8）上使用适当的`local_ip`和`dp_rank_start`执行`run_multi_dp.sh`："
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:743
 msgid "192.168.10.5: `dp_rank_start=0`"
@@ -712,7 +738,8 @@ msgstr "基准测试结果"
 msgid ""
 "The following benchmark demonstrates UCM prefix cache effectiveness in "
 "large-scale Expert Parallelism PD disaggregation scenarios."
-msgstr "以下基准测试展示了UCM前缀缓存在大规模专家并行PD分离部署场景中的有效性。"
+msgstr ""
+"以下基准测试展示了UCM前缀缓存在大规模专家并行PD分离部署场景中的有效性。"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:764
 msgid "**Test Configuration:**"
@@ -730,7 +757,8 @@ msgstr "请求并发数：128"
 msgid ""
 "Constraint: Total requests kept within Prefill instance's available HBM "
 "capacity for KV cache storage"
-msgstr "约束条件：总请求数保持在Prefill实例可用HBM容量范围内以存储KV缓存"
+msgstr ""
+"约束条件：总请求数保持在Prefill实例可用HBM容量范围内以存储KV缓存"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:770
 msgid "**KV Cache Pre-seeding Procedure:**"
@@ -747,9 +775,7 @@ msgid ""
 "**Pre-seed Phase**: Send 128 requests with input length = "
 "`target_input_length × 0.8` and output length = 1 to establish the KV "
 "cache prefix"
-msgstr ""
-"**预填充阶段**：发送 128 个请求，输入长度 = `target_input_length × 0.8`，输出长度 = 1，以建立 KV "
-"缓存前缀"
+msgstr "**预填充阶段**：发送 128 个请求，输入长度 = `target_input_length × 0.8`，输出长度 = 1，以建立 KV 缓存前缀"
 
 #: ../../source/user_guide/feature_guide/ucm_deployment.md:775
 msgid ""
@@ -829,11 +855,7 @@ msgid ""
 " hit rate equal to the pre-seeding ratio of 0.8, significantly reducing "
 "TTFT compared to HBM PC. The improved TTFT effectively increases Prefill "
 "instance throughput, thereby boosting the overall system throughput."
-msgstr ""
-"**注意**：由于数据并行性，测试阶段的请求可能不会被路由到用于 KV 缓存预填充的同一 DP 进程。因此，HBM PC "
-"的实际缓存命中率低于预期的 0.8。UCM 通过将所有 KV 缓存存储在共享外部存储中来解决此限制，确保无论请求由哪个 DP "
-"进程处理，都能命中缓存数据。这保证了真实的缓存命中率等于预填充比例 0.8，与 HBM PC 相比显著降低了 TTFT。改进的 TTFT "
-"有效提高了 Prefill 实例的吞吐量，从而提升了整体系统吞吐量。"
+msgstr "**注意**：由于数据并行性，测试阶段的请求可能不会被路由到用于 KV 缓存预填充的同一 DP 进程。因此，HBM PC 的实际缓存命中率低于预期的 0.8。UCM 通过将所有 KV 缓存存储在共享外部存储中来解决此限制，确保无论请求由哪个 DP 进程处理，都能命中缓存数据。这保证了真实的缓存命中率等于预填充比例 0.8，与 HBM PC 相比显著降低了 TTFT。改进的 TTFT 有效提高了 Prefill 实例的吞吐量，从而提升了整体系统吞吐量。"
 
 #~ msgid "Overview"
 #~ msgstr "概述"
@@ -986,6 +1008,3 @@ msgstr ""
 #~ "这表明在第二个请求期间，UCM 成功地从存储后端检索了所有 125 个缓存的 KV "
 #~ "块。利用完全缓存的前缀显著降低了模型观察到的初始延迟，与初始运行相比，TTFT 提升了约 **8 "
 #~ "倍**。"
-
-#~ msgid "CANN (Ascend 910C, 910B)"
-#~ msgstr "CANN（Ascend 910C、910B）"
