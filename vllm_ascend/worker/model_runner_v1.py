@@ -132,6 +132,7 @@ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
+from vllm_ascend.spec_decode.gemma4_proposer import AscendGemma4Proposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
@@ -381,7 +382,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_ids = self._make_buffer(max_buffer_num_tokens, dtype=torch.int32)
             self.positions = torch.zeros(
                 max_buffer_num_tokens, dtype=torch.int64, device=self.device)
-            
+
         # Create a CPU numpy buffer for positions computation when
         # self.positions is a plain tensor (non-CpuGpuBuffer case).
         self._positions_cpu_buf = torch.zeros(
@@ -536,6 +537,7 @@ class NPUModelRunner(GPUModelRunner):
             | AscendEagleProposer
             | AscendDraftModelProposer
             | AscendDflashProposer
+            | AscendGemma4Proposer
             | AscendSuffixDecodingProposer
             | AscendMedusaProposer
             | AscendExtractHiddenStatesProposer
@@ -1385,8 +1387,8 @@ class NPUModelRunner(GPUModelRunner):
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
         default_stream = torch.npu.current_stream()
-        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):  
-            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  
+        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):
+            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)
             counts = valid_sampled_tokens_count
             counts_cpu = self.valid_sampled_token_count_cpu
             assert counts_cpu is not None
@@ -1687,7 +1689,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-       
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -1716,9 +1718,9 @@ class NPUModelRunner(GPUModelRunner):
         if ((
             self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
         ) or (
-            # NOTE: This branch specifically triggers a deepcopy during the prefill phase 
-            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios. 
-            # It does not affect other use cases. This is a temporary workaround and 
+            # NOTE: This branch specifically triggers a deepcopy during the prefill phase
+            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios.
+            # It does not affect other use cases. This is a temporary workaround and
             # will be removed once upstream vLLM provides native support for PCP + MM.
             self.pcp_size > 1 and self.supports_mm_inputs and get_pp_group().is_first_rank
             and not self.model_config.is_encoder_decoder
@@ -3004,11 +3006,16 @@ class NPUModelRunner(GPUModelRunner):
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
+                if isinstance(self.drafter, AscendGemma4Proposer):
+                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                        spec_decode_common_attn_metadata = cm
+                elif isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
+            if self.speculative_config and isinstance(self.drafter, AscendGemma4Proposer):
+                self.drafter.set_per_group_block_table(kv_cache_gid, cm.block_table_tensor)
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
@@ -3495,7 +3502,20 @@ class NPUModelRunner(GPUModelRunner):
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
-        if self.speculative_config and (
+        use_gemma4_mtp = (
+            getattr(self.speculative_config, "use_gemma4_mtp", lambda: False)()
+            if self.speculative_config
+            else False
+        )
+        if use_gemma4_mtp:
+            assert isinstance(self.drafter, AscendGemma4Proposer)
+            kernel_block_sizes = (
+                self.kernel_block_sizes
+                if isinstance(self.kernel_block_sizes, list)
+                else [self.kernel_block_sizes]
+            )
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        elif self.speculative_config and (
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)

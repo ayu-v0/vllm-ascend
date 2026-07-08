@@ -116,6 +116,13 @@ def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
         hf_config.update({"n_predict": n_predict, "architectures": ["LongCatFlashMTPModel"]})
 
+    if hf_config.model_type in ("gemma4_assistant", "gemma4_unified_assistant"):
+        hf_config.model_type = "gemma4_mtp"
+        text_config = getattr(hf_config, "text_config", hf_config)
+        if hasattr(text_config, "num_kv_shared_layers"):
+            text_config.num_kv_shared_layers = 0
+        hf_config.update({"n_predict": 1, "architectures": ["Gemma4MTPModel"]})
+
     if hf_config.model_type == "step3p5":
         hf_config.model_type = "step3p5_mtp"
         n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)

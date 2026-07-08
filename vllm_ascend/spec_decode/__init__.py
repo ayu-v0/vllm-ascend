@@ -24,10 +24,20 @@ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
+from vllm_ascend.spec_decode.gemma4_proposer import AscendGemma4Proposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
 from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
+
+
+def _use_gemma4_mtp(vllm_config):
+    use_gemma4_mtp = getattr(
+        vllm_config.speculative_config,
+        "use_gemma4_mtp",
+        lambda: False,
+    )
+    return use_gemma4_mtp()
 
 
 def get_spec_decode_method(method, vllm_config, device, runner):
@@ -39,6 +49,8 @@ def get_spec_decode_method(method, vllm_config, device, runner):
         return AscendSuffixDecodingProposer(vllm_config, runner)
     elif method == "medusa":
         return AscendMedusaProposer(vllm_config, device)
+    elif method == "mtp" and _use_gemma4_mtp(vllm_config):
+        return AscendGemma4Proposer(vllm_config, device, runner)
     elif method in ("eagle", "eagle3", "mtp"):
         return AscendEagleProposer(vllm_config, device, runner)
     elif method == "dflash":
