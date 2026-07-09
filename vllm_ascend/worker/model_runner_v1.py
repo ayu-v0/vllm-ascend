@@ -1277,13 +1277,23 @@ class NPUModelRunner(GPUModelRunner):
         elif np.all(num_scheduled_tokens == 1):
             attn_state = AscendAttentionState.DecodeOnly
             if self.speculative_config and self.speculative_config.method == "mtp":
-                # SpecDecoding now supports seq_len=1 and seq_len=2
-                # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
-                attn_state = AscendAttentionState.SpecDecoding
+                # `AscendAttentionState.SpecDecoding` is only designed for mla.
+                if self.vllm_config.model_config.use_mla:
+                    # SpecDecoding now supports seq_len=1 and seq_len=2
+                    # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
+                    attn_state = AscendAttentionState.SpecDecoding
+                else:
+                    attn_state = AscendAttentionState.ChunkedPrefill
         # Speculative decoding.
         elif np.all(num_valid_tokens == 1):
             if self.speculative_config:
-                attn_state = AscendAttentionState.SpecDecoding
+                if (
+                    self.speculative_config.method == "mtp"
+                    and not self.vllm_config.model_config.use_mla
+                ):
+                    attn_state = AscendAttentionState.ChunkedPrefill
+                else:
+                    attn_state = AscendAttentionState.SpecDecoding
             else:
                 attn_state = AscendAttentionState.ChunkedPrefill
         # splitfuse
