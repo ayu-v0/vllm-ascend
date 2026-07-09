@@ -35,6 +35,33 @@ def test_ascend_base_uses_per_group_metadata_builder_for_gemma4_mtp():
     assert "per_layer_attn_metadata[self.attn_layer_names[0]]" in source
 
 
+def test_gemma4_mtp_diagnostic_stage_logs_are_present():
+    base_source = BASE_SOURCE.read_text(encoding="utf-8")
+    runner_source = (
+        Path(__file__).parents[3]
+        / "vllm_ascend"
+        / "worker"
+        / "model_runner_v1.py"
+    ).read_text(encoding="utf-8")
+
+    for marker in [
+        "Gemma4 MTP debug: draft_token stage",
+        "Gemma4 MTP debug: propose_draft_token_ids enter",
+        "Gemma4 MTP debug: _propose enter",
+        "Gemma4 MTP debug: run_draft start",
+        "Gemma4 MTP debug: _run_merged_draft model forward start",
+        "Gemma4 MTP debug: _run_merged_draft logits start",
+        "Gemma4 MTP debug: _copy_draft_token_ids_to_cpu",
+        "Gemma4 MTP debug: bookkeeping_sync done",
+        "Gemma4 MTP debug: finalize_kv_connector start",
+        "Gemma4 MTP debug: async output construct start",
+        "Gemma4 MTP debug: async get_output debug enabled",
+        "Gemma4 MTP debug: async output return",
+    ]:
+        assert marker in base_source or marker in runner_source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
     test_ascend_base_uses_per_group_metadata_builder_for_gemma4_mtp()
+    test_gemma4_mtp_diagnostic_stage_logs_are_present()

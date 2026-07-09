@@ -106,6 +106,12 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return target_argmax
 
 
+def _debug_shape(value: Any) -> tuple[int, ...] | None:
+    if torch.is_tensor(value):
+        return tuple(value.shape)
+    return None
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
@@ -581,6 +587,32 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
+        use_gemma4_mtp_debug = getattr(
+            self.speculative_config,
+            "use_gemma4_mtp",
+            lambda: False,
+        )()
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: _propose enter "
+                "batch_size=%s target_token_ids_shape=%s "
+                "target_positions_shape=%s target_hidden_states_shape=%s "
+                "next_token_ids_shape=%s token_indices_to_sample_shape=%s "
+                "use_cuda_graph=%s method=%s num_speculative_tokens=%s "
+                "draft_attn_groups=%s common_num_reqs=%s common_max_seq_len=%s",
+                batch_size,
+                _debug_shape(target_token_ids),
+                _debug_shape(target_positions),
+                _debug_shape(target_hidden_states),
+                _debug_shape(next_token_ids),
+                _debug_shape(token_indices_to_sample),
+                self.use_cuda_graph,
+                self.method,
+                self.num_speculative_tokens,
+                len(self.draft_attn_groups),
+                getattr(common_attn_metadata, "num_reqs", None),
+                getattr(common_attn_metadata, "max_seq_len", None),
+            )
 
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
@@ -603,6 +635,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
         )
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: set_inputs_first_pass done "
+                "num_tokens=%s token_indices_to_sample_shape=%s "
+                "common_num_reqs=%s common_max_seq_len=%s long_seq_args=%s",
+                num_tokens,
+                _debug_shape(token_indices_to_sample),
+                getattr(common_attn_metadata, "num_reqs", None),
+                getattr(common_attn_metadata, "max_seq_len", None),
+                long_seq_args is not None,
+            )
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
@@ -619,11 +662,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             num_input_tokens = num_tokens
 
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: sync_metadata start num_input_tokens=%s",
+                num_input_tokens,
+            )
         (
             num_input_tokens,
             num_tokens_across_dp,
             _,
         ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: sync_metadata done "
+                "num_input_tokens=%s num_tokens_across_dp=%s",
+                num_input_tokens,
+                num_tokens_across_dp,
+            )
 
         if self.use_cuda_graph:
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
@@ -725,15 +780,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
 
         common_attn_metadata.num_input_tokens = num_input_tokens
-        use_gemma4_mtp = getattr(
-            self.speculative_config,
-            "use_gemma4_mtp",
-            lambda: False,
-        )
-        if use_gemma4_mtp():
+        if use_gemma4_mtp_debug:
             # Gemma4 MTP has multiple KV cache groups and needs group-specific
             # block tables instead of reusing the first draft attention group's
             # metadata for every draft layer.
+            logger.warning(
+                "Gemma4 MTP debug: per-group metadata start "
+                "common_num_reqs=%s block_table_shape=%s",
+                getattr(common_attn_metadata, "num_reqs", None),
+                _debug_shape(getattr(common_attn_metadata, "block_table_tensor", None)),
+            )
             _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
             seen_metadata_ids: set[int] = set()
             for attn_metadata in per_layer_attn_metadata.values():
@@ -743,6 +799,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 seen_metadata_ids.add(metadata_id)
                 if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
                     attn_metadata.attn_mask = None
+            logger.warning(
+                "Gemma4 MTP debug: per-group metadata done "
+                "layer_count=%s metadata_count=%s",
+                len(per_layer_attn_metadata),
+                len(seen_metadata_ids),
+            )
         else:
             # FIXME(woosuk): The below two ops cause synchronization. Optimize.
             assert len(self.draft_attn_groups) > 0
@@ -906,12 +968,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
             run_draft = partial(self._runnable, **model_inputs)
 
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: run_draft start "
+                    "num_input_tokens=%s num_tokens=%s "
+                    "token_indices_to_sample_len=%s multi_steps=%s "
+                    "aclgraph_runtime_mode=%s",
+                    num_input_tokens,
+                    num_tokens,
+                    token_indices_to_sample_len,
+                    len(multi_steps_attn_metadata),
+                    aclgraph_runtime_mode,
+                )
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
                 draft_token_ids = run_draft()
             else:
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: run_draft done draft_token_ids_shape=%s",
+                    _debug_shape(draft_token_ids),
+                )
         return draft_token_ids
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
@@ -939,6 +1018,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
+        use_gemma4_mtp_debug = getattr(
+            self.speculative_config,
+            "use_gemma4_mtp",
+            lambda: False,
+        )()
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
@@ -958,17 +1042,58 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: _run_merged_draft model forward start "
+                "input_ids_shape=%s positions_shape=%s hidden_states_shape=%s "
+                "inputs_embeds_shape=%s multi_steps=%s num_tokens=%s "
+                "num_input_tokens=%s model_returns_tuple=%s",
+                _debug_shape(model_kwargs.get("input_ids")),
+                _debug_shape(model_kwargs.get("positions")),
+                _debug_shape(model_kwargs.get("hidden_states")),
+                _debug_shape(model_kwargs.get("inputs_embeds")),
+                len(multi_steps_attn_metadata),
+                num_tokens,
+                num_input_tokens,
+                self.model_returns_tuple(),
+            )
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
             hidden_states = last_hidden_states
         else:
             last_hidden_states, hidden_states = ret_hidden_states
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: _run_merged_draft model forward done "
+                "ret_type=%s last_hidden_states_shape=%s hidden_states_shape=%s",
+                type(ret_hidden_states).__name__,
+                _debug_shape(last_hidden_states),
+                _debug_shape(hidden_states),
+            )
 
         if self.method != "dflash":
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: maybe_all_gather_and_unpad start "
+                    "last_hidden_states_shape=%s model_positions_shape=%s "
+                    "hidden_states_shape=%s",
+                    _debug_shape(last_hidden_states),
+                    _debug_shape(model_positions),
+                    _debug_shape(hidden_states),
+                )
             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
                 last_hidden_states, model_positions, hidden_states
             )
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: maybe_all_gather_and_unpad done "
+                    "last_hidden_states_shape=%s model_positions_shape=%s "
+                    "hidden_states_shape=%s",
+                    _debug_shape(last_hidden_states),
+                    _debug_shape(model_positions),
+                    _debug_shape(hidden_states),
+                )
 
         num_indices = token_indices_to_sample.shape[0]
         if self.pcp_size > 1:
@@ -1002,6 +1127,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
+        if use_gemma4_mtp_debug:
+            inner_model = getattr(self.model, "model", None)
+            logger.warning(
+                "Gemma4 MTP debug: _run_merged_draft logits start "
+                "sample_hidden_states_shape=%s num_indices=%s "
+                "enable_reduce_sample=%s has_compute_logits=%s lmhead_tp=%s",
+                _debug_shape(sample_hidden_states),
+                num_indices,
+                get_ascend_config().enable_reduce_sample,
+                hasattr(inner_model, "compute_logits"),
+                lmhead_tp_enable(),
+            )
         if get_ascend_config().enable_reduce_sample and self.method in ("eagle3", "dflash"):
             draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
             if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
@@ -1030,6 +1167,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     logits = logits[:num_indices]
                     token_indices_to_sample = token_indices_to_sample[:num_indices]
                 draft_token_ids = logits.argmax(dim=-1)
+
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: _run_merged_draft logits done "
+                "draft_token_ids_shape=%s token_indices_to_sample_shape=%s",
+                _debug_shape(draft_token_ids),
+                _debug_shape(token_indices_to_sample),
+            )
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
