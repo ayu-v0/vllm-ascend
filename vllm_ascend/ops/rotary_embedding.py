@@ -153,13 +153,16 @@ def get_cos_and_sin_slice():
 def rope_forward_oot(
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor,
+    key: torch.Tensor | None,
     cos_sin_cache: torch.Tensor,
     head_size: int,
     rotary_dim: int,
     is_neox_style: bool,
     offsets: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    key_was_none = key is None
+    if key_was_none:
+        key = torch.empty_like(query)
     query_shape, key_shape = query.shape, key.shape
     if offsets is not None:
         raise NotImplementedError("Batched rotary embedding is currently not supported on NPU.")
@@ -210,6 +213,8 @@ def rope_forward_oot(
                 cos_sin_cache,
                 is_neox_style,
             )
+    if key_was_none:
+        return query.view(query_shape), None
     return query.view(query_shape), key.view(key_shape)
 
 
@@ -234,7 +239,7 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         offsets: torch.Tensor | None = None,
         is_neox_style_override: bool | None = None,
     ):
