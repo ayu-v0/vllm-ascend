@@ -67,6 +67,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
+    DraftTokenIds,
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
@@ -1693,6 +1694,22 @@ class NPUModelRunner(GPUModelRunner):
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
         return draft_token_ids
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if not self.num_spec_tokens or not self._draft_token_req_ids:
+            return None
+
+        if isinstance(self.drafter, AscendGemma4Proposer) and not self.use_async_scheduling:
+            req_ids = self._draft_token_req_ids
+            draft_token_ids = self._draft_token_ids
+            if isinstance(draft_token_ids, list):
+                return DraftTokenIds(req_ids, draft_token_ids)
+            if not torch.is_tensor(draft_token_ids):
+                return None
+            draft_token_ids_cpu = draft_token_ids.detach().cpu().tolist()
+            return DraftTokenIds(req_ids, draft_token_ids_cpu)
+
+        return super().take_draft_token_ids()
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
