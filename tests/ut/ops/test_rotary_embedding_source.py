@@ -16,22 +16,36 @@ def _function_source(source: Path, function_name: str) -> str:
 
 
 def test_rope_forward_oot_accepts_query_only_rotary():
-    source = _function_source(ROTARY_SOURCE, "rope_forward_oot")
+    source = _function_source(ROTARY_SOURCE, "forward_oot")
 
     assert "key: torch.Tensor | None" in source
     assert "key_was_none = key is None" in source
-    assert "key = torch.empty_like(query)" in source
-    assert "return (query.view(query_shape), None)" in source
+    assert "rotary_key = torch.empty_like(query) if key_was_none else key" in source
+    assert "return (query, None)" in source
 
 
-def test_rotary_custom_op_fake_accepts_query_only_rotary():
+def test_rotary_custom_op_schema_stays_tensor_only():
+    source = _function_source(ROTARY_SOURCE, "rope_forward_oot")
+    signature = source.splitlines()[0]
+
+    assert "key: torch.Tensor," in signature
+    assert "-> tuple[torch.Tensor, torch.Tensor]" in signature
+    assert "key: torch.Tensor | None" not in signature
+    assert "tuple[torch.Tensor, torch.Tensor | None]" not in signature
+
+
+def test_rotary_custom_op_fake_schema_stays_tensor_only():
     source = _function_source(REGISTER_SOURCE, "_rope_forward_oot_impl_fake")
+    signature = source.splitlines()[0]
 
-    assert "key: torch.Tensor | None" in source
-    assert "tuple[torch.Tensor, torch.Tensor | None]" in source
+    assert "key: torch.Tensor," in signature
+    assert "-> tuple[torch.Tensor, torch.Tensor]" in signature
+    assert "key: torch.Tensor | None" not in signature
+    assert "tuple[torch.Tensor, torch.Tensor | None]" not in signature
     assert "return (query, key)" in source
 
 
 if __name__ == "__main__":
     test_rope_forward_oot_accepts_query_only_rotary()
-    test_rotary_custom_op_fake_accepts_query_only_rotary()
+    test_rotary_custom_op_schema_stays_tensor_only()
+    test_rotary_custom_op_fake_schema_stays_tensor_only()
