@@ -15,14 +15,14 @@ def _method_source(method_name: str) -> str:
     raise AssertionError(f"{method_name} was not found")
 
 
-def test_mtp_spec_decoding_state_is_limited_to_mla_models():
+def test_mtp_runtime_keeps_spec_decoding_state_for_non_mla_models():
     source = _method_source("_build_attn_state")
 
-    assert "`AscendAttentionState.SpecDecoding` is only designed for mla" in source
-    assert "self.vllm_config.model_config.use_mla" in source
+    assert "`AscendAttentionState.SpecDecoding` is only designed for mla" not in source
+    assert "self.speculative_config and self.speculative_config.method == \"mtp\"" in source
     assert "attn_state = AscendAttentionState.SpecDecoding" in source
-    assert "attn_state = AscendAttentionState.ChunkedPrefill" in source
+    assert "and not self.vllm_config.model_config.use_mla" not in source
 
 
 if __name__ == "__main__":
-    test_mtp_spec_decoding_state_is_limited_to_mla_models()
+    test_mtp_runtime_keeps_spec_decoding_state_for_non_mla_models()
