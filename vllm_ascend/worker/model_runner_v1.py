@@ -193,6 +193,22 @@ def _debug_shape(value: Any) -> tuple[int, ...] | None:
     return None
 
 
+def _debug_token_preview(value: Any, max_rows: int = 2, max_cols: int = 8) -> Any:
+    if torch.is_tensor(value):
+        if value.ndim == 0:
+            return value.detach().cpu().item()
+        value = value.detach().cpu()[:max_rows]
+        if value.ndim > 1:
+            value = value[:, :max_cols]
+        return value.tolist()
+    if isinstance(value, list):
+        preview = []
+        for row in value[:max_rows]:
+            preview.append(row[:max_cols] if isinstance(row, list) else row)
+        return preview
+    return None
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -2555,12 +2571,12 @@ class NPUModelRunner(GPUModelRunner):
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
+        max_gen_len = sampled_token_ids.shape[-1]
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
-            max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
@@ -2593,6 +2609,23 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch.prev_req_id_to_index = {
                 req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
             }
+
+        if isinstance(self.drafter, AscendGemma4Proposer):
+            logger.warning(
+                "Gemma4 MTP debug: parsed sampled tokens "
+                "raw_shape=%s raw_preview=%s valid_lens=%s valid_preview=%s "
+                "vocab_size=%s max_gen_len=%s spec_decode_metadata=%s "
+                "discard_indices=%s invalid_req_indices=%s",
+                _debug_shape(sampled_token_ids),
+                _debug_token_preview(sampled_token_ids),
+                [len(ids) for ids in valid_sampled_token_ids],
+                _debug_token_preview(valid_sampled_token_ids),
+                self.input_batch.vocab_size,
+                max_gen_len,
+                spec_decode_metadata is not None,
+                discard_sampled_tokens_req_indices.tolist(),
+                invalid_req_indices,
+            )
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.

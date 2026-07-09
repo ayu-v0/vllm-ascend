@@ -53,6 +53,7 @@ def test_gemma4_mtp_diagnostic_stage_logs_are_present():
         "Gemma4 MTP debug: _run_merged_draft logits start",
         "Gemma4 MTP debug: _copy_draft_token_ids_to_cpu",
         "Gemma4 MTP debug: bookkeeping_sync done",
+        "Gemma4 MTP debug: parsed sampled tokens",
         "Gemma4 MTP debug: finalize_kv_connector start",
         "Gemma4 MTP debug: async output construct start",
         "Gemma4 MTP debug: async get_output debug enabled",
