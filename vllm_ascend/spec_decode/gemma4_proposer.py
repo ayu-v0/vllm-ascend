@@ -30,6 +30,11 @@ class AscendGemma4Proposer(Gemma4Proposer, AscendSpecDecodeBaseProposer):
             pass_hidden_states_to_model=True,
             runner=runner,
         )
+        # Gemma4 MTP has mixed local/global attention heads and a 512-dim
+        # global head. Full ACL graph padding makes small online batches run at
+        # graph capture sizes, which is too expensive for this drafter path.
+        self.use_cuda_graph = False
+        self._runnable = self._run_merged_draft
         self.constant_draft_positions = True
         self._per_group_block_tables: dict[int, torch.Tensor] = {}
         self._centroids_sizes: list[int] = []
