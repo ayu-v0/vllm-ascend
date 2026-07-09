@@ -2473,6 +2473,8 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.async_copy_ready_event is not None,
                 _debug_shape(self.input_batch.sampled_token_ids_cpu),
             )
+        if use_gemma4_mtp_debug:
+            return async_output.get_output()
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -3657,20 +3659,21 @@ class NPUModelRunner(GPUModelRunner):
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
-        # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
-        self.need_accepted_tokens = any(
-            [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups]
-        )
-
-        self.may_reinitialize_input_batch(kv_cache_config)
-        kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-        # TODO: refactor the logic of attention
-        # Initialize drafter attention group initialization
         use_gemma4_mtp = (
             getattr(self.speculative_config, "use_gemma4_mtp", lambda: False)()
             if self.speculative_config
             else False
         )
+        # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
+        self.need_accepted_tokens = any(
+            [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups]
+        )
+        self.need_accepted_tokens = self.need_accepted_tokens or use_gemma4_mtp
+
+        self.may_reinitialize_input_batch(kv_cache_config)
+        kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        # TODO: refactor the logic of attention
+        # Initialize drafter attention group initialization
         if use_gemma4_mtp:
             assert isinstance(self.drafter, AscendGemma4Proposer)
             kernel_block_sizes = (
