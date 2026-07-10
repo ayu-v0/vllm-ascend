@@ -267,6 +267,10 @@ def apply_sampling_constraints(
         return apply_top_k_top_p(logits, k, p)
 
 
+def _use_triton_rejection_path(draft_probs: torch.Tensor | None) -> bool:
+    return HAS_TRITON and draft_probs is not None
+
+
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
@@ -427,7 +431,7 @@ def rejection_sample(
 
         if not using_block_verify:
             # Rejection sampling for random sampling requests with selected logits
-            if HAS_TRITON:
+            if _use_triton_rejection_path(draft_probs):
                 rejection_random_sample_kernel[(grid,)](
                     output_token_ids,
                     cu_num_draft_tokens,
@@ -465,7 +469,7 @@ def rejection_sample(
                     enable_reduce_sampling=True,
                 )
         else:
-            if HAS_TRITON:
+            if _use_triton_rejection_path(draft_probs):
                 rejection_random_sample_block_verify_kernel[(grid,)](
                     output_token_ids,
                     cu_num_draft_tokens,
@@ -537,7 +541,7 @@ def rejection_sample(
         )
 
         if not using_block_verify:
-            if HAS_TRITON:
+            if _use_triton_rejection_path(draft_probs):
                 rejection_random_sample_kernel[(grid,)](
                     output_token_ids,
                     cu_num_draft_tokens,
@@ -575,7 +579,7 @@ def rejection_sample(
                     enable_reduce_sampling=False,
                 )
         else:
-            if HAS_TRITON:
+            if _use_triton_rejection_path(draft_probs):
                 rejection_random_sample_block_verify_kernel[(grid,)](
                     output_token_ids,
                     cu_num_draft_tokens,
@@ -692,7 +696,7 @@ def sample_recovered_tokens(
         q[i] = torch.where(has_draft_mask[i], temp_q, q[i])
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
-    if HAS_TRITON:
+    if _use_triton_rejection_path(draft_probs):
         sample_recovered_tokens_kernel[(batch_size, max_spec_len)](
             recovered_token_ids,
             cu_num_draft_tokens,
