@@ -1505,10 +1505,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
 
         if (
-            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-            and self.sliding_window is None
+            self.sliding_window is None
             and (
-                using_paged_attention(num_tokens, self.vllm_config) or self._should_use_large_head_attention_fallback()
+                (
+                    attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                    and (
+                        using_paged_attention(num_tokens, self.vllm_config)
+                        or self._should_use_large_head_attention_fallback()
+                    )
+                )
+                or (
+                    attn_metadata.attn_state == AscendAttentionState.SpecDecoding
+                    and self._should_use_large_head_attention_fallback()
+                )
             )
         ):
             output = self.forward_paged_attention(query, attn_metadata, output)

@@ -899,6 +899,19 @@ class NPUPlatform(Platform):
                 )
                 vllm_config.speculative_config.quantization = None
 
+            use_gemma4_mtp = getattr(vllm_config.speculative_config, "use_gemma4_mtp", None)
+            if (
+                callable(use_gemma4_mtp)
+                and use_gemma4_mtp()
+                and vllm_config.scheduler_config
+                and vllm_config.scheduler_config.async_scheduling is not False
+            ):
+                logger.warning(
+                    "Gemma4 MTP does not support async scheduling on Ascend yet. "
+                    "Resetting scheduler_config.async_scheduling to False."
+                )
+                vllm_config.scheduler_config.async_scheduling = False
+
         # ==================== 7. KV Transfer Config ====================
         if vllm_config.kv_transfer_config:
             # Buffer size is primarily tied to NCCL (GPU) backends

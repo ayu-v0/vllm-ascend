@@ -67,6 +67,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
+    DraftTokenIds,
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
@@ -132,6 +133,7 @@ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
+from vllm_ascend.spec_decode.gemma4_proposer import AscendGemma4Proposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
@@ -183,6 +185,28 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+
+def _debug_shape(value: Any) -> tuple[int, ...] | None:
+    if torch.is_tensor(value):
+        return tuple(value.shape)
+    return None
+
+
+def _debug_token_preview(value: Any, max_rows: int = 2, max_cols: int = 8) -> Any:
+    if torch.is_tensor(value):
+        if value.ndim == 0:
+            return value.detach().cpu().item()
+        value = value.detach().cpu()[:max_rows]
+        if value.ndim > 1:
+            value = value[:, :max_cols]
+        return value.tolist()
+    if isinstance(value, list):
+        preview = []
+        for row in value[:max_rows]:
+            preview.append(row[:max_cols] if isinstance(row, list) else row)
+        return preview
+    return None
 
 
 @dataclass
@@ -381,7 +405,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_ids = self._make_buffer(max_buffer_num_tokens, dtype=torch.int32)
             self.positions = torch.zeros(
                 max_buffer_num_tokens, dtype=torch.int64, device=self.device)
-            
+
         # Create a CPU numpy buffer for positions computation when
         # self.positions is a plain tensor (non-CpuGpuBuffer case).
         self._positions_cpu_buf = torch.zeros(
@@ -536,6 +560,7 @@ class NPUModelRunner(GPUModelRunner):
             | AscendEagleProposer
             | AscendDraftModelProposer
             | AscendDflashProposer
+            | AscendGemma4Proposer
             | AscendSuffixDecodingProposer
             | AscendMedusaProposer
             | AscendExtractHiddenStatesProposer
@@ -1385,8 +1410,8 @@ class NPUModelRunner(GPUModelRunner):
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
         default_stream = torch.npu.current_stream()
-        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):  
-            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  
+        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):
+            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)
             counts = valid_sampled_tokens_count
             counts_cpu = self.valid_sampled_token_count_cpu
             assert counts_cpu is not None
@@ -1413,6 +1438,23 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
+        use_gemma4_mtp_debug = isinstance(self.drafter, AscendGemma4Proposer)
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: propose_draft_token_ids enter "
+                "sampled_token_ids_type=%s sampled_token_ids_shape=%s "
+                "spec_decode_metadata=%s common_attn_metadata=%s "
+                "positions_shape=%s num_scheduled_tokens=%s "
+                "hidden_states_shape=%s sample_hidden_states_shape=%s",
+                type(valid_sampled_token_ids).__name__,
+                _debug_shape(valid_sampled_token_ids),
+                spec_decode_metadata is not None,
+                spec_decode_common_attn_metadata is not None,
+                _debug_shape(positions),
+                num_scheduled_tokens,
+                _debug_shape(hidden_states),
+                _debug_shape(sample_hidden_states),
+            )
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -1520,6 +1562,16 @@ class NPUModelRunner(GPUModelRunner):
                     "sampled_token_ids should be a torch.Tensor whenpadded-batch is enabled."
                 )
                 assert self.drafter is not None
+                if use_gemma4_mtp_debug:
+                    logger.warning(
+                        "Gemma4 MTP debug: prepare_next_token_ids_padded start "
+                        "sampled_token_ids_shape=%s num_reqs=%s "
+                        "discard_request_indices_shape=%s num_discarded_requests=%s",
+                        _debug_shape(sampled_token_ids),
+                        self.input_batch.num_reqs,
+                        _debug_shape(self.discard_request_indices.gpu),
+                        self.num_discarded_requests,
+                    )
                 next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
                     sampled_token_ids,
                     self.requests,
@@ -1527,6 +1579,13 @@ class NPUModelRunner(GPUModelRunner):
                     self.discard_request_indices.gpu,
                     self.num_discarded_requests,
                 )
+                if use_gemma4_mtp_debug:
+                    logger.warning(
+                        "Gemma4 MTP debug: prepare_next_token_ids_padded done "
+                        "next_token_ids_shape=%s valid_sampled_tokens_count_shape=%s",
+                        _debug_shape(next_token_ids),
+                        _debug_shape(valid_sampled_tokens_count),
+                    )
 
             req_scheduled_tokens = scheduler_output.num_scheduled_tokens
             if self.use_cp:
@@ -1607,6 +1666,22 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: drafter._propose start "
+                    "target_token_ids_shape=%s target_positions_shape=%s "
+                    "target_hidden_states_shape=%s next_token_ids_shape=%s "
+                    "token_indices_to_sample_shape=%s common_num_reqs=%s "
+                    "common_max_seq_len=%s req_scheduled_tokens=%s",
+                    _debug_shape(target_token_ids),
+                    _debug_shape(target_positions),
+                    _debug_shape(target_hidden_states),
+                    _debug_shape(next_token_ids),
+                    _debug_shape(token_indices_to_sample),
+                    getattr(common_attn_metadata, "num_reqs", None),
+                    getattr(common_attn_metadata, "max_seq_len", None),
+                    req_scheduled_tokens,
+                )
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -1624,6 +1699,11 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: drafter._propose done draft_token_ids_shape=%s",
+                    _debug_shape(draft_token_ids),
+                )
             if not self.vllm_config.speculative_config.disable_padded_drafter_batch:
                 self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
         else:
@@ -1631,26 +1711,70 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if not self.num_spec_tokens or not self._draft_token_req_ids:
+            return None
+
+        if isinstance(self.drafter, AscendGemma4Proposer) and not self.use_async_scheduling:
+            req_ids = self._draft_token_req_ids
+            draft_token_ids = self._draft_token_ids
+            if isinstance(draft_token_ids, list):
+                return DraftTokenIds(req_ids, draft_token_ids)
+            if not torch.is_tensor(draft_token_ids):
+                return None
+            draft_token_ids_cpu = draft_token_ids.detach().cpu().tolist()
+            return DraftTokenIds(req_ids, draft_token_ids_cpu)
+
+        return super().take_draft_token_ids()
+
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
+        use_gemma4_mtp_debug = isinstance(self.drafter, AscendGemma4Proposer)
         if not self.num_spec_tokens:
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: _copy_draft_token_ids_to_cpu skip "
+                    "reason=no_num_spec_tokens"
+                )
             return
         if self.use_async_scheduling and not (
             scheduler_output.has_structured_output_requests
             or self.input_batch.sampling_metadata.output_token_ids
         ):
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: _copy_draft_token_ids_to_cpu skip "
+                    "reason=async_no_structured_or_output_token_ids "
+                    "has_structured_output_requests=%s has_output_token_ids=%s",
+                    scheduler_output.has_structured_output_requests,
+                    bool(self.input_batch.sampling_metadata.output_token_ids),
+                )
             return
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
         draft_token_ids: torch.Tensor = self._draft_token_ids  # type: ignore[has-type]
         if not torch.is_tensor(draft_token_ids):
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: _copy_draft_token_ids_to_cpu skip "
+                    "reason=draft_token_ids_not_tensor type=%s",
+                    type(draft_token_ids).__name__,
+                )
             return
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_copy_stream is not None
         assert self.draft_token_ids_cpu is not None
         default_stream = torch.npu.current_stream()
         num_reqs = draft_token_ids.shape[0]
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: _copy_draft_token_ids_to_cpu start "
+                "draft_token_ids_shape=%s zeros_only=%s num_reqs=%s",
+                _debug_shape(draft_token_ids),
+                zeros_only,
+                num_reqs,
+            )
         with torch.npu.stream(self.draft_token_ids_copy_stream):
             if not zeros_only:
                 self.draft_token_ids_copy_stream.wait_stream(default_stream)
@@ -1660,6 +1784,10 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 self.draft_token_ids_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: _copy_draft_token_ids_to_cpu event recorded"
+            )
 
     @torch.inference_mode()
     def execute_model(
@@ -1687,7 +1815,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-       
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -1716,9 +1844,9 @@ class NPUModelRunner(GPUModelRunner):
         if ((
             self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
         ) or (
-            # NOTE: This branch specifically triggers a deepcopy during the prefill phase 
-            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios. 
-            # It does not affect other use cases. This is a temporary workaround and 
+            # NOTE: This branch specifically triggers a deepcopy during the prefill phase
+            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios.
+            # It does not affect other use cases. This is a temporary workaround and
             # will be removed once upstream vLLM provides native support for PCP + MM.
             self.pcp_size > 1 and self.supports_mm_inputs and get_pp_group().is_first_rank
             and not self.model_config.is_encoder_decoder
@@ -2127,6 +2255,7 @@ class NPUModelRunner(GPUModelRunner):
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+        use_gemma4_mtp_debug = isinstance(self.drafter, AscendGemma4Proposer)
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2151,6 +2280,13 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            if isinstance(self.drafter, AscendGemma4Proposer):
+                logger.warning(
+                    "Gemma4 MTP debug: propose_draft_token_ids wrapper enter "
+                    "sampled_token_ids_shape=%s sampled_token_ids_type=%s",
+                    _debug_shape(sampled_token_ids),
+                    type(sampled_token_ids).__name__,
+                )
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
@@ -2165,6 +2301,12 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: propose_draft_token_ids wrapper done "
+                    "draft_token_ids_shape=%s",
+                    _debug_shape(self._draft_token_ids),
+                )
 
         (
             logprobs_lists,
@@ -2181,6 +2323,16 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: bookkeeping_sync done "
+                "valid_sampled_token_ids_len=%s invalid_req_indices=%s "
+                "req_ids_output_len=%s prompt_logprobs=%s",
+                len(valid_sampled_token_ids),
+                invalid_req_indices,
+                len(req_ids_output_copy),
+                prompt_logprobs_dict is not None,
+            )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -2198,6 +2350,22 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
+                if isinstance(self.drafter, AscendGemma4Proposer):
+                    logger.warning(
+                        "Gemma4 MTP debug: draft_token stage "
+                        "input_fits_in_drafter=%s use_padded_batch=%s "
+                        "common_attn_metadata=%s sampled_token_ids_shape=%s "
+                        "num_reqs=%s max_seq_len=%s "
+                        "effective_drafter_max_model_len=%s num_spec_tokens=%s",
+                        input_fits_in_drafter,
+                        use_padded_batch,
+                        spec_decode_common_attn_metadata is not None,
+                        _debug_shape(sampler_output.sampled_token_ids),
+                        self.input_batch.num_reqs,
+                        getattr(spec_decode_common_attn_metadata, "max_seq_len", None),
+                        self.effective_drafter_max_model_len,
+                        self.num_spec_tokens,
+                    )
                 if use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
@@ -2230,7 +2398,11 @@ class NPUModelRunner(GPUModelRunner):
             # forward when speculative decoding is enabled. Finalize here after
             # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
+                if use_gemma4_mtp_debug:
+                    logger.warning("Gemma4 MTP debug: finalize_kv_connector start")
                 self.finalize_kv_connector()
+                if use_gemma4_mtp_debug:
+                    logger.warning("Gemma4 MTP debug: finalize_kv_connector done")
 
         routed_experts_lists = None
         if self.model_config.enable_return_routed_experts:
@@ -2294,7 +2466,18 @@ class NPUModelRunner(GPUModelRunner):
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
         if not self.use_async_scheduling:
+            if use_gemma4_mtp_debug:
+                logger.warning("Gemma4 MTP debug: sync output return")
             return model_runner_output
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: async output construct start "
+                "sampled_token_ids_shape=%s logprobs_tensors=%s "
+                "invalid_req_indices=%s",
+                _debug_shape(sampler_output.sampled_token_ids),
+                sampler_output.logprobs_tensors is not None,
+                invalid_req_indices,
+            )
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -2303,10 +2486,28 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
         )
+        if use_gemma4_mtp_debug:
+            async_output._gemma4_mtp_debug = True
+            logger.warning("Gemma4 MTP debug: async get_output debug enabled")
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: async output construct done "
+                "sampled_token_ids_cpu_shape=%s",
+                _debug_shape(getattr(async_output, "sampled_token_ids_cpu", None)),
+            )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        if use_gemma4_mtp_debug:
+            logger.warning(
+                "Gemma4 MTP debug: async output return "
+                "stored_async_event=%s stored_sampled_token_ids_cpu=%s",
+                self.input_batch.async_copy_ready_event is not None,
+                _debug_shape(self.input_batch.sampled_token_ids_cpu),
+            )
+        if use_gemma4_mtp_debug:
+            return async_output.get_output()
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -2370,12 +2571,12 @@ class NPUModelRunner(GPUModelRunner):
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
+        max_gen_len = sampled_token_ids.shape[-1]
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
-            max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
@@ -2408,6 +2609,23 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch.prev_req_id_to_index = {
                 req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
             }
+
+        if isinstance(self.drafter, AscendGemma4Proposer):
+            logger.warning(
+                "Gemma4 MTP debug: parsed sampled tokens "
+                "raw_shape=%s raw_preview=%s valid_lens=%s valid_preview=%s "
+                "vocab_size=%s max_gen_len=%s spec_decode_metadata=%s "
+                "discard_indices=%s invalid_req_indices=%s",
+                _debug_shape(sampled_token_ids),
+                _debug_token_preview(sampled_token_ids),
+                [len(ids) for ids in valid_sampled_token_ids],
+                _debug_token_preview(valid_sampled_token_ids),
+                self.input_batch.vocab_size,
+                max_gen_len,
+                spec_decode_metadata is not None,
+                discard_sampled_tokens_req_indices.tolist(),
+                invalid_req_indices,
+            )
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -3004,11 +3222,16 @@ class NPUModelRunner(GPUModelRunner):
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
+                if isinstance(self.drafter, AscendGemma4Proposer):
+                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                        spec_decode_common_attn_metadata = cm
+                elif isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
+            if self.speculative_config and isinstance(self.drafter, AscendGemma4Proposer):
+                self.drafter.set_per_group_block_table(kv_cache_gid, cm.block_table_tensor)
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
@@ -3486,16 +3709,30 @@ class NPUModelRunner(GPUModelRunner):
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
+        use_gemma4_mtp = (
+            getattr(self.speculative_config, "use_gemma4_mtp", lambda: False)()
+            if self.speculative_config
+            else False
+        )
         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
         self.need_accepted_tokens = any(
             [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups]
         )
+        self.need_accepted_tokens = self.need_accepted_tokens or use_gemma4_mtp
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
-        if self.speculative_config and (
+        if use_gemma4_mtp:
+            assert isinstance(self.drafter, AscendGemma4Proposer)
+            kernel_block_sizes = (
+                self.kernel_block_sizes
+                if isinstance(self.kernel_block_sizes, list)
+                else [self.kernel_block_sizes]
+            )
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        elif self.speculative_config and (
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)

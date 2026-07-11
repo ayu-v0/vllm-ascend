@@ -863,6 +863,31 @@ class RecomputeScheduler(Scheduler):
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            if scheduled_spec_token_ids and not generated_token_ids:
+                old_num_computed_tokens = request.num_computed_tokens
+                request.num_computed_tokens = max(
+                    0, request.num_computed_tokens - num_tokens_scheduled
+                )
+                if request.num_output_placeholders > 0:
+                    request.num_output_placeholders = max(
+                        0,
+                        request.num_output_placeholders - num_tokens_scheduled,
+                    )
+                logger.warning(
+                    "Spec decode scheduler debug: empty generated tokens after "
+                    "scheduled draft validation; rolling back request state. "
+                    "req_id=%s num_tokens_scheduled=%s scheduled_spec_tokens=%s "
+                    "num_computed_tokens=%s->%s num_tokens=%s "
+                    "num_output_tokens=%s num_output_placeholders=%s",
+                    req_id,
+                    num_tokens_scheduled,
+                    scheduled_spec_token_ids,
+                    old_num_computed_tokens,
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                    request.num_output_tokens,
+                    request.num_output_placeholders,
+                )
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
