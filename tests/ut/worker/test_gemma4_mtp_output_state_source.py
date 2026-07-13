@@ -39,7 +39,20 @@ def test_gemma4_mtp_takes_draft_tokens_without_async_event_wait():
     assert "DraftTokenIds(req_ids, draft_token_ids_cpu)" in source
 
 
+def test_gemma4_mtp_logs_target_verification_inputs_and_logits():
+    text = SOURCE.read_text(encoding="utf-8")
+
+    assert "Gemma4 MTP debug: target_verify_inputs" in text
+    assert "input_ids_preview=%s" in text
+    assert "positions_preview=%s" in text
+    assert "metadata_draft_preview=%s" in text
+    assert "Gemma4 MTP debug: target_verify_logits" in text
+    assert "target_top_ids=%s" in text
+    assert "target_top_values=%s" in text
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_enables_accepted_token_state_updates()
     test_gemma4_mtp_keeps_async_output_async_by_default()
     test_gemma4_mtp_takes_draft_tokens_without_async_event_wait()
+    test_gemma4_mtp_logs_target_verification_inputs_and_logits()

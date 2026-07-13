@@ -15,5 +15,15 @@ def test_no_draft_probs_rejection_uses_pytorch_fallback():
     assert source.count("if _use_triton_rejection_path(draft_probs):") >= 3
 
 
+def test_rejection_sampler_logs_spec_decode_target_processing():
+    source = REJECTION_SAMPLER.read_text(encoding="utf-8")
+
+    assert "Gemma4 MTP debug: rejection_sampler target logits" in source
+    assert "raw_target_top_ids=%s" in source
+    assert "processed_target_top_ids=%s" in source
+    assert "output_preview=%s" in source
+
+
 if __name__ == "__main__":
     test_no_draft_probs_rejection_uses_pytorch_fallback()
+    test_rejection_sampler_logs_spec_decode_target_processing()

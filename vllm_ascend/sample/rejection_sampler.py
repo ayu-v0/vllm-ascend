@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import replace
+from typing import Any
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
@@ -18,6 +19,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.ascend_config import get_ascend_config
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size,
     expand_triton,
@@ -28,6 +30,50 @@ from vllm_ascend.ops.triton.reject_sample import (
 )
 from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+
+
+_GEMMA4_MTP_DEBUG = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_DEBUG
+
+
+def _debug_token_preview(value: Any, max_rows: int = 2, max_cols: int = 8) -> Any:
+    if torch.is_tensor(value):
+        if value.ndim == 0:
+            return value.detach().cpu().item()
+        value = value.detach().cpu()[:max_rows]
+        if value.ndim > 1:
+            value = value[:, :max_cols]
+        return value.tolist()
+    if isinstance(value, list):
+        preview = []
+        for row in value[:max_rows]:
+            preview.append(row[:max_cols] if isinstance(row, list) else row)
+        return preview
+    return None
+
+
+def _debug_topk_preview(
+    logits: torch.Tensor | None,
+    indices: torch.Tensor | None = None,
+    max_rows: int = 2,
+    k: int = 8,
+) -> tuple[Any, Any]:
+    if logits is None or not torch.is_tensor(logits):
+        return None, None
+    try:
+        rows = logits[:max_rows]
+        if rows.numel() == 0:
+            return [], []
+        top_k = min(k, rows.shape[-1])
+        top_values, top_local_ids = torch.topk(rows.float(), k=top_k, dim=-1)
+        if indices is None:
+            top_ids = top_local_ids
+        else:
+            top_ids = indices[:max_rows].gather(dim=-1, index=top_local_ids)
+        return _debug_token_preview(top_ids, max_rows, k), _debug_token_preview(
+            top_values, max_rows, k
+        )
+    except Exception as exc:
+        return f"<topk failed: {type(exc).__name__}: {exc}>", None
 
 
 class AscendRejectionSampler(RejectionSampler):
@@ -141,6 +187,11 @@ class AscendRejectionSampler(RejectionSampler):
         raw_target_logits = logits[target_logits_indices]
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
+        raw_target_top_ids = raw_target_top_values = None
+        if _GEMMA4_MTP_DEBUG:
+            raw_target_top_ids, raw_target_top_values = _debug_topk_preview(
+                raw_target_logits
+            )
         target_logits = raw_target_logits
         if not self.is_processed_logprobs_mode:
             # Clone raw_target_logits before applying processors to preserve
@@ -154,6 +205,16 @@ class AscendRejectionSampler(RejectionSampler):
         target_logits = apply_sampling_constraints(
             target_logits, metadata.cu_num_draft_tokens, sampling_metadata, self.top_k
         )
+        processed_target_top_ids = processed_target_top_values = None
+        if _GEMMA4_MTP_DEBUG:
+            if isinstance(target_logits, tuple):
+                processed_target_top_ids, processed_target_top_values = (
+                    _debug_topk_preview(target_logits[0], target_logits[1])
+                )
+            else:
+                processed_target_top_ids, processed_target_top_values = (
+                    _debug_topk_preview(target_logits)
+                )
 
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
@@ -165,6 +226,25 @@ class AscendRejectionSampler(RejectionSampler):
             bonus_token_ids,
             sampling_metadata,
         )
+        if _GEMMA4_MTP_DEBUG:
+            logger.warning(
+                "Gemma4 MTP debug: rejection_sampler target logits "
+                "raw_target_top_ids=%s raw_target_top_values=%s "
+                "processed_target_top_ids=%s processed_target_top_values=%s "
+                "draft_token_ids_preview=%s bonus_token_ids_preview=%s "
+                "output_preview=%s all_greedy=%s max_spec_len=%s "
+                "draft_probs=%s",
+                raw_target_top_ids,
+                raw_target_top_values,
+                processed_target_top_ids,
+                processed_target_top_values,
+                _debug_token_preview(metadata.draft_token_ids),
+                _debug_token_preview(bonus_token_ids),
+                _debug_token_preview(output_token_ids),
+                sampling_metadata.all_greedy,
+                metadata.max_spec_len,
+                draft_probs is not None,
+            )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:

@@ -211,6 +211,35 @@ def _debug_token_preview(value: Any, max_rows: int = 2, max_cols: int = 8) -> An
     return None
 
 
+def _debug_topk_preview(
+    logits: torch.Tensor | None,
+    row_indices: torch.Tensor | None = None,
+    max_rows: int = 2,
+    k: int = 8,
+) -> tuple[Any, Any]:
+    if logits is None or not torch.is_tensor(logits):
+        return None, None
+    try:
+        if row_indices is None:
+            rows = logits[:max_rows]
+        else:
+            row_indices = row_indices[:max_rows].to(
+                device=logits.device, dtype=torch.long
+            )
+            if row_indices.numel() == 0:
+                return [], []
+            rows = logits.index_select(0, row_indices)
+        if rows.numel() == 0:
+            return [], []
+        top_k = min(k, rows.shape[-1])
+        top_values, top_ids = torch.topk(rows.float(), k=top_k, dim=-1)
+        return _debug_token_preview(top_ids, max_rows, k), _debug_token_preview(
+            top_values, max_rows, k
+        )
+    except Exception as exc:
+        return f"<topk failed: {type(exc).__name__}: {exc}>", None
+
+
 def _gemma4_mtp_debug_enabled(drafter: Any) -> bool:
     return _GEMMA4_MTP_DEBUG and isinstance(drafter, AscendGemma4Proposer)
 
@@ -2089,6 +2118,35 @@ class NPUModelRunner(GPUModelRunner):
 
             # update global cos, sin
             update_cos_sin(positions)
+            if (
+                spec_decode_metadata is not None
+                and _gemma4_mtp_debug_enabled(self.drafter)
+            ):
+                logger.warning(
+                    "Gemma4 MTP debug: target_verify_inputs "
+                    "input_ids_shape=%s input_ids_preview=%s "
+                    "positions_shape=%s positions_preview=%s "
+                    "logits_indices_shape=%s logits_indices_preview=%s "
+                    "metadata_draft_shape=%s metadata_draft_preview=%s "
+                    "target_logits_indices_preview=%s "
+                    "bonus_logits_indices_preview=%s "
+                    "scheduled_spec_decode_tokens=%s",
+                    _debug_shape(input_ids),
+                    _debug_token_preview(input_ids),
+                    _debug_shape(positions),
+                    _debug_token_preview(positions),
+                    _debug_shape(logits_indices),
+                    _debug_token_preview(logits_indices),
+                    _debug_shape(spec_decode_metadata.draft_token_ids),
+                    _debug_token_preview(spec_decode_metadata.draft_token_ids),
+                    _debug_token_preview(
+                        spec_decode_metadata.target_logits_indices
+                    ),
+                    _debug_token_preview(
+                        spec_decode_metadata.bonus_logits_indices
+                    ),
+                    scheduler_output.scheduled_spec_decode_tokens,
+                )
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
@@ -2195,6 +2253,29 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+            if (
+                spec_decode_metadata is not None
+                and _gemma4_mtp_debug_enabled(self.drafter)
+            ):
+                target_top_ids, target_top_values = _debug_topk_preview(
+                    logits, spec_decode_metadata.target_logits_indices
+                )
+                bonus_top_ids, bonus_top_values = _debug_topk_preview(
+                    logits, spec_decode_metadata.bonus_logits_indices
+                )
+                logger.warning(
+                    "Gemma4 MTP debug: target_verify_logits "
+                    "sample_hidden_states_shape=%s logits_shape=%s "
+                    "target_top_ids=%s target_top_values=%s "
+                    "bonus_top_ids=%s bonus_top_values=%s",
+                    _debug_shape(sample_hidden_states),
+                    _debug_shape(logits),
+                    target_top_ids,
+                    target_top_values,
+                    bonus_top_ids,
+                    bonus_top_values,
+                )
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(

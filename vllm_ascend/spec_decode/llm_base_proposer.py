@@ -122,6 +122,42 @@ def _debug_shape(value: Any) -> tuple[int, ...] | None:
     return None
 
 
+def _debug_token_preview(value: Any, max_rows: int = 2, max_cols: int = 8) -> Any:
+    if torch.is_tensor(value):
+        if value.ndim == 0:
+            return value.detach().cpu().item()
+        value = value.detach().cpu()[:max_rows]
+        if value.ndim > 1:
+            value = value[:, :max_cols]
+        return value.tolist()
+    if isinstance(value, list):
+        preview = []
+        for row in value[:max_rows]:
+            preview.append(row[:max_cols] if isinstance(row, list) else row)
+        return preview
+    return None
+
+
+def _debug_topk_preview(
+    logits: torch.Tensor | None,
+    max_rows: int = 2,
+    k: int = 8,
+) -> tuple[Any, Any]:
+    if logits is None or not torch.is_tensor(logits):
+        return None, None
+    try:
+        rows = logits[:max_rows]
+        if rows.numel() == 0:
+            return [], []
+        top_k = min(k, rows.shape[-1])
+        top_values, top_ids = torch.topk(rows.float(), k=top_k, dim=-1)
+        return _debug_token_preview(top_ids, max_rows, k), _debug_token_preview(
+            top_values, max_rows, k
+        )
+    except Exception as exc:
+        return f"<topk failed: {type(exc).__name__}: {exc}>", None
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
@@ -1004,10 +1040,34 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
         logits = self.model.logits_processor(self.model.lm_head, hidden_states)
+        use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.speculative_config)
         if not hasattr(self.model, "draft_id_to_target_id") or self.model.draft_id_to_target_id is None:
-            return greedy_sample(logits)
+            next_token = greedy_sample(logits)
+            if use_gemma4_mtp_debug:
+                draft_top_ids, draft_top_values = _debug_topk_preview(logits)
+                logger.warning(
+                    "Gemma4 MTP debug: compute_draft_token_ids logits "
+                    "logits_shape=%s draft_top_ids=%s draft_top_values=%s "
+                    "next_token_preview=%s",
+                    _debug_shape(logits),
+                    draft_top_ids,
+                    draft_top_values,
+                    _debug_token_preview(next_token),
+                )
+            return next_token
         logits = logits.contiguous()
         next_token = greedy_sample(logits)
+        if use_gemma4_mtp_debug:
+            draft_top_ids, draft_top_values = _debug_topk_preview(logits)
+            logger.warning(
+                "Gemma4 MTP debug: compute_draft_token_ids logits "
+                "logits_shape=%s draft_top_ids=%s draft_top_values=%s "
+                "next_token_preview=%s",
+                _debug_shape(logits),
+                draft_top_ids,
+                draft_top_values,
+                _debug_token_preview(next_token),
+            )
         bias = torch.index_select(self.model.draft_id_to_target_id, dim=0, index=next_token.view(-1)).view(
             next_token.shape
         )
@@ -1176,8 +1236,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if use_gemma4_mtp_debug:
             logger.warning(
                 "Gemma4 MTP debug: _run_merged_draft logits done "
-                "draft_token_ids_shape=%s token_indices_to_sample_shape=%s",
+                "draft_token_ids_shape=%s draft_token_ids_preview=%s "
+                "token_indices_to_sample_shape=%s",
                 _debug_shape(draft_token_ids),
+                _debug_token_preview(draft_token_ids),
                 _debug_shape(token_indices_to_sample),
             )
 

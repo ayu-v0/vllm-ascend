@@ -69,7 +69,16 @@ def test_gemma4_mtp_diagnostic_stage_logs_are_present():
     ).read_text(encoding="utf-8")
 
 
+def test_gemma4_mtp_draft_logits_logs_token_preview_and_topk():
+    base_source = BASE_SOURCE.read_text(encoding="utf-8")
+
+    assert "draft_token_ids_preview=%s" in base_source
+    assert "draft_top_ids=%s" in base_source
+    assert "draft_top_values=%s" in base_source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
     test_ascend_base_uses_per_group_metadata_builder_for_gemma4_mtp()
     test_gemma4_mtp_diagnostic_stage_logs_are_present()
+    test_gemma4_mtp_draft_logits_logs_token_preview_and_topk()
