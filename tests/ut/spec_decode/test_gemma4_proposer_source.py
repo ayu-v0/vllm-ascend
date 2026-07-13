@@ -77,8 +77,19 @@ def test_gemma4_mtp_draft_logits_logs_token_preview_and_topk():
     assert "draft_top_values=%s" in base_source
 
 
+def test_gemma4_mtp_uses_specialized_greedy_sampling_for_draft_tokens():
+    source = _method_source_from(BASE_SOURCE, "_run_merged_draft")
+
+    assert "if use_gemma4_mtp:" in source
+    assert "draft_token_ids = self._greedy_sample(sample_hidden_states)" in source
+    gemma4_branch = source.split("if use_gemma4_mtp:", 1)[1].split("else:", 1)[0]
+    assert "self.model.compute_logits(sample_hidden_states)" not in gemma4_branch
+    assert "logits.argmax(dim=-1)" not in gemma4_branch
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
     test_ascend_base_uses_per_group_metadata_builder_for_gemma4_mtp()
     test_gemma4_mtp_diagnostic_stage_logs_are_present()
     test_gemma4_mtp_draft_logits_logs_token_preview_and_topk()
+    test_gemma4_mtp_uses_specialized_greedy_sampling_for_draft_tokens()

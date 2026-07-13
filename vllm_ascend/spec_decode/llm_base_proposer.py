@@ -1204,7 +1204,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 hasattr(inner_model, "compute_logits"),
                 lmhead_tp_enable(),
             )
-        if get_ascend_config().enable_reduce_sample and self.method in ("eagle3", "dflash"):
+        if use_gemma4_mtp:
+            draft_token_ids = self._greedy_sample(sample_hidden_states)
+            if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
+                draft_token_ids = draft_token_ids[:num_indices]
+                token_indices_to_sample = token_indices_to_sample[:num_indices]
+        elif get_ascend_config().enable_reduce_sample and self.method in ("eagle3", "dflash"):
             draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
             if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
                 draft_token_ids = draft_token_ids[:num_indices]
@@ -1373,7 +1378,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     draft_token_ids = draft_token_ids[:num_indices]
                     token_indices_to_sample = token_indices_to_sample[:num_indices]
             else:
-                if get_ascend_config().enable_reduce_sample and self.method in ("mtp"):
+                if use_gemma4_mtp:
+                    draft_token_ids = self._greedy_sample(sample_hidden_states)
+                    if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
+                        draft_token_ids = draft_token_ids[:num_indices]
+                        token_indices_to_sample = token_indices_to_sample[:num_indices]
+                elif get_ascend_config().enable_reduce_sample and self.method in ("mtp"):
                     if not hasattr(self.model.model, "compute_logits"):
                         draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
                         if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:

@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata

@@ -18,6 +18,7 @@ def test_no_draft_probs_rejection_uses_pytorch_fallback():
 def test_rejection_sampler_logs_spec_decode_target_processing():
     source = REJECTION_SAMPLER.read_text(encoding="utf-8")
 
+    assert "from vllm.logger import logger" in source
     assert "Gemma4 MTP debug: rejection_sampler target logits" in source
     assert "raw_target_top_ids=%s" in source
     assert "processed_target_top_ids=%s" in source
