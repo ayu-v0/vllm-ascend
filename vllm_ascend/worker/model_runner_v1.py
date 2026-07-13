@@ -79,6 +79,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.utils import select_common_block_size
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.utils import vllm_version_is
 
 if not vllm_version_is("0.20.2"):
@@ -185,6 +186,7 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+_GEMMA4_MTP_DEBUG = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_DEBUG
 
 
 def _debug_shape(value: Any) -> tuple[int, ...] | None:
@@ -207,6 +209,10 @@ def _debug_token_preview(value: Any, max_rows: int = 2, max_cols: int = 8) -> An
             preview.append(row[:max_cols] if isinstance(row, list) else row)
         return preview
     return None
+
+
+def _gemma4_mtp_debug_enabled(drafter: Any) -> bool:
+    return _GEMMA4_MTP_DEBUG and isinstance(drafter, AscendGemma4Proposer)
 
 
 @dataclass
@@ -1438,7 +1444,7 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
-        use_gemma4_mtp_debug = isinstance(self.drafter, AscendGemma4Proposer)
+        use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.drafter)
         if use_gemma4_mtp_debug:
             logger.warning(
                 "Gemma4 MTP debug: propose_draft_token_ids enter "
@@ -1730,7 +1736,7 @@ class NPUModelRunner(GPUModelRunner):
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
-        use_gemma4_mtp_debug = isinstance(self.drafter, AscendGemma4Proposer)
+        use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.drafter)
         if not self.num_spec_tokens:
             if use_gemma4_mtp_debug:
                 logger.warning(
@@ -2255,7 +2261,7 @@ class NPUModelRunner(GPUModelRunner):
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
-        use_gemma4_mtp_debug = isinstance(self.drafter, AscendGemma4Proposer)
+        use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.drafter)
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2280,7 +2286,7 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            if isinstance(self.drafter, AscendGemma4Proposer):
+            if use_gemma4_mtp_debug:
                 logger.warning(
                     "Gemma4 MTP debug: propose_draft_token_ids wrapper enter "
                     "sampled_token_ids_shape=%s sampled_token_ids_type=%s",
@@ -2350,7 +2356,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
-                if isinstance(self.drafter, AscendGemma4Proposer):
+                if use_gemma4_mtp_debug:
                     logger.warning(
                         "Gemma4 MTP debug: draft_token stage "
                         "input_fits_in_drafter=%s use_padded_batch=%s "
@@ -2487,9 +2493,6 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.input_batch.vocab_size,
         )
         if use_gemma4_mtp_debug:
-            async_output._gemma4_mtp_debug = True
-            logger.warning("Gemma4 MTP debug: async get_output debug enabled")
-        if use_gemma4_mtp_debug:
             logger.warning(
                 "Gemma4 MTP debug: async output construct done "
                 "sampled_token_ids_cpu_shape=%s",
@@ -2506,8 +2509,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.async_copy_ready_event is not None,
                 _debug_shape(self.input_batch.sampled_token_ids_cpu),
             )
-        if use_gemma4_mtp_debug:
-            return async_output.get_output()
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -2610,7 +2611,7 @@ class NPUModelRunner(GPUModelRunner):
                 req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
             }
 
-        if isinstance(self.drafter, AscendGemma4Proposer):
+        if _gemma4_mtp_debug_enabled(self.drafter):
             logger.warning(
                 "Gemma4 MTP debug: parsed sampled tokens "
                 "raw_shape=%s raw_preview=%s valid_lens=%s valid_preview=%s "

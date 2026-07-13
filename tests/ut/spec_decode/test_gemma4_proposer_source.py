@@ -56,10 +56,17 @@ def test_gemma4_mtp_diagnostic_stage_logs_are_present():
         "Gemma4 MTP debug: parsed sampled tokens",
         "Gemma4 MTP debug: finalize_kv_connector start",
         "Gemma4 MTP debug: async output construct start",
-        "Gemma4 MTP debug: async get_output debug enabled",
         "Gemma4 MTP debug: async output return",
     ]:
         assert marker in base_source or marker in runner_source
+
+    assert "_gemma4_mtp_debug_enabled" in base_source
+    assert "_gemma4_mtp_debug_enabled" in runner_source
+    assert "VLLM_ASCEND_GEMMA4_MTP_DEBUG" in (
+        Path(__file__).parents[3]
+        / "vllm_ascend"
+        / "envs.py"
+    ).read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":

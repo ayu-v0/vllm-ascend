@@ -114,6 +114,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Enable verbose Gemma4 MTP diagnostics. This is off by default because
+    # the diagnostic path logs every decode step and may force CPU/NPU sync.
+    "VLLM_ASCEND_GEMMA4_MTP_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_GEMMA4_MTP_DEBUG", "0"))),
 }
 
 # end-env-vars-definition

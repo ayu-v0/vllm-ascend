@@ -23,11 +23,11 @@ def test_gemma4_mtp_enables_accepted_token_state_updates():
     assert "self.need_accepted_tokens = self.need_accepted_tokens or use_gemma4_mtp" in source
 
 
-def test_gemma4_mtp_materializes_async_output_in_worker():
+def test_gemma4_mtp_keeps_async_output_async_by_default():
     source = _method_source("sample_tokens")
 
-    assert "use_gemma4_mtp_debug = isinstance(self.drafter, AscendGemma4Proposer)" in source
-    assert "return async_output.get_output()" in source
+    assert "use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.drafter)" in source
+    assert "return async_output.get_output()" not in source
 
 
 def test_gemma4_mtp_takes_draft_tokens_without_async_event_wait():
@@ -41,5 +41,5 @@ def test_gemma4_mtp_takes_draft_tokens_without_async_event_wait():
 
 if __name__ == "__main__":
     test_gemma4_mtp_enables_accepted_token_state_updates()
-    test_gemma4_mtp_materializes_async_output_in_worker()
+    test_gemma4_mtp_keeps_async_output_async_by_default()
     test_gemma4_mtp_takes_draft_tokens_without_async_event_wait()

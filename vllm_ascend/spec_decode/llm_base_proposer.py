@@ -41,6 +41,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -54,6 +55,15 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enab
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+_GEMMA4_MTP_DEBUG = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_DEBUG
+
+
+def _use_gemma4_mtp(speculative_config: Any) -> bool:
+    return getattr(speculative_config, "use_gemma4_mtp", lambda: False)()
+
+
+def _gemma4_mtp_debug_enabled(speculative_config: Any) -> bool:
+    return _GEMMA4_MTP_DEBUG and _use_gemma4_mtp(speculative_config)
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -587,11 +597,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
-        use_gemma4_mtp_debug = getattr(
-            self.speculative_config,
-            "use_gemma4_mtp",
-            lambda: False,
-        )()
+        use_gemma4_mtp = _use_gemma4_mtp(self.speculative_config)
+        use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.speculative_config)
         if use_gemma4_mtp_debug:
             logger.warning(
                 "Gemma4 MTP debug: _propose enter "
@@ -780,16 +787,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
 
         common_attn_metadata.num_input_tokens = num_input_tokens
-        if use_gemma4_mtp_debug:
+        if use_gemma4_mtp:
             # Gemma4 MTP has multiple KV cache groups and needs group-specific
             # block tables instead of reusing the first draft attention group's
             # metadata for every draft layer.
-            logger.warning(
-                "Gemma4 MTP debug: per-group metadata start "
-                "common_num_reqs=%s block_table_shape=%s",
-                getattr(common_attn_metadata, "num_reqs", None),
-                _debug_shape(getattr(common_attn_metadata, "block_table_tensor", None)),
-            )
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: per-group metadata start "
+                    "common_num_reqs=%s block_table_shape=%s",
+                    getattr(common_attn_metadata, "num_reqs", None),
+                    _debug_shape(getattr(common_attn_metadata, "block_table_tensor", None)),
+                )
             _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
             seen_metadata_ids: set[int] = set()
             for attn_metadata in per_layer_attn_metadata.values():
@@ -799,12 +807,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 seen_metadata_ids.add(metadata_id)
                 if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
                     attn_metadata.attn_mask = None
-            logger.warning(
-                "Gemma4 MTP debug: per-group metadata done "
-                "layer_count=%s metadata_count=%s",
-                len(per_layer_attn_metadata),
-                len(seen_metadata_ids),
-            )
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP debug: per-group metadata done "
+                    "layer_count=%s metadata_count=%s",
+                    len(per_layer_attn_metadata),
+                    len(seen_metadata_ids),
+                )
         else:
             # FIXME(woosuk): The below two ops cause synchronization. Optimize.
             assert len(self.draft_attn_groups) > 0
@@ -1018,11 +1027,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
-        use_gemma4_mtp_debug = getattr(
-            self.speculative_config,
-            "use_gemma4_mtp",
-            lambda: False,
-        )()
+        use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.speculative_config)
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
