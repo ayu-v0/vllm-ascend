@@ -50,3 +50,8 @@ class AscendGemma4Proposer(Gemma4Proposer, AscendSpecDecodeBaseProposer):
         graph optimization can be added later behind a separate validation step.
         """
         logger.info("Gemma4 MTP: skip CUDA centroid graph capture on Ascend.")
+
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if getattr(self.model, "masked_embedding", None) is not None:
+            return self.model.get_top_tokens(hidden_states)
+        return super()._greedy_sample(hidden_states)

@@ -27,6 +27,14 @@ def test_gemma4_mtp_disables_drafter_full_aclgraph():
     assert "self._runnable = self._run_merged_draft" in source
 
 
+def test_ascend_gemma4_uses_sparse_top_tokens_without_cuda_graphs():
+    source = _method_source("_greedy_sample")
+
+    assert "masked_embedding" in source
+    assert "self.model.get_top_tokens(hidden_states)" in source
+    assert "super()._greedy_sample(hidden_states)" in source
+
+
 def test_ascend_base_uses_per_group_metadata_builder_for_gemma4_mtp():
     source = _method_source_from(BASE_SOURCE, "_propose")
 
@@ -87,9 +95,20 @@ def test_gemma4_mtp_uses_specialized_greedy_sampling_for_draft_tokens():
     assert "logits.argmax(dim=-1)" not in gemma4_branch
 
 
+def test_run_merged_draft_initializes_gemma4_mtp_flag_before_use():
+    source = _method_source_from(BASE_SOURCE, "_run_merged_draft")
+
+    init = "use_gemma4_mtp = _use_gemma4_mtp(self.speculative_config)"
+    use = "if use_gemma4_mtp:"
+    assert init in source
+    assert source.index(init) < source.index(use)
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
+    test_ascend_gemma4_uses_sparse_top_tokens_without_cuda_graphs()
     test_ascend_base_uses_per_group_metadata_builder_for_gemma4_mtp()
     test_gemma4_mtp_diagnostic_stage_logs_are_present()
     test_gemma4_mtp_draft_logits_logs_token_preview_and_topk()
     test_gemma4_mtp_uses_specialized_greedy_sampling_for_draft_tokens()
+    test_run_merged_draft_initializes_gemma4_mtp_flag_before_use()

@@ -1087,6 +1087,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
+        use_gemma4_mtp = _use_gemma4_mtp(self.speculative_config)
         use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.speculative_config)
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
