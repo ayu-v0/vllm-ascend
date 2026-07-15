@@ -1352,7 +1352,17 @@ class NPUModelRunner(GPUModelRunner):
 
         # For the overlay of the PCP feature and the eagle3, attn_state needs to be recovered
         # TODO: Resolved the conflict between the sunset of attn_state and the PCP that requires this interface.
-        if attn_state == AscendAttentionState.SpecDecoding and self.speculative_config.method != "mtp":
+        # Keep the returned state for scheduling, but use ChunkedPrefill
+        # metadata for non-MLA backends. Gemma4 MTP target verification has
+        # multi-token query groups and KV sharing that need the prefill path.
+        if (
+            attn_state == AscendAttentionState.SpecDecoding
+            and self.speculative_config is not None
+            and (
+                self.speculative_config.method != "mtp"
+                or not self.vllm_config.model_config.use_mla
+            )
+        ):
             self.attn_state = AscendAttentionState.ChunkedPrefill  # type: ignore
         else:
             self.attn_state = attn_state  # type: ignore
