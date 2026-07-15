@@ -35,6 +35,14 @@ def test_ascend_gemma4_uses_sparse_top_tokens_without_cuda_graphs():
     assert "super()._greedy_sample(hidden_states)" in source
 
 
+def test_ascend_gemma4_syncs_kv_sharing_target_into_backend_impl():
+    source = _method_source("_setup_gemma4_kv_sharing")
+
+    assert "super()._setup_gemma4_kv_sharing(target_attn_layer_names)" in source
+    assert 'impl = getattr(attn, "impl", None)' in source
+    assert "impl.kv_sharing_target_layer_name = target_layer_name" in source
+
+
 def test_ascend_base_uses_per_group_metadata_builder_for_gemma4_mtp():
     source = _method_source_from(BASE_SOURCE, "_propose")
 
@@ -110,6 +118,7 @@ def test_run_merged_draft_initializes_gemma4_mtp_flag_before_use():
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
     test_ascend_gemma4_uses_sparse_top_tokens_without_cuda_graphs()
+    test_ascend_gemma4_syncs_kv_sharing_target_into_backend_impl()
     test_ascend_base_uses_per_group_metadata_builder_for_gemma4_mtp()
     test_gemma4_mtp_diagnostic_stage_logs_are_present()
     test_gemma4_mtp_draft_logits_logs_token_preview_and_topk()

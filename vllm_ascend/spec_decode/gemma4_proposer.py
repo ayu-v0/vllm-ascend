@@ -42,6 +42,32 @@ class AscendGemma4Proposer(Gemma4Proposer, AscendSpecDecodeBaseProposer):
         self._centroids_inputs: dict[int, torch.Tensor] = {}
         self._centroids_outputs: dict[int, torch.Tensor] = {}
 
+    def _setup_gemma4_kv_sharing(
+        self,
+        target_attn_layer_names: set[str],
+    ) -> None:
+        """Propagate post-construction KV sharing mappings to Ascend backends."""
+        super()._setup_gemma4_kv_sharing(target_attn_layer_names)
+
+        if not (hasattr(self.model, "model") and hasattr(self.model.model, "layers")):
+            return
+
+        # Gemma4Proposer wires the high-level Attention modules after model
+        # construction. AscendAttentionBackendImpl receives its own copy at
+        # construction, so it must be updated explicitly as well.
+        for draft_idx, layer in enumerate(self.model.model.layers):
+            attn = getattr(getattr(layer, "self_attn", None), "attn", None)
+            target_layer_name = getattr(attn, "kv_sharing_target_layer_name", None)
+            impl = getattr(attn, "impl", None)
+            if target_layer_name is None or impl is None:
+                continue
+            impl.kv_sharing_target_layer_name = target_layer_name
+            logger.info(
+                "Gemma4 MTP: synced draft layer %d backend KV target -> %s",
+                draft_idx,
+                target_layer_name,
+            )
+
     def _setup_centroids_cuda_graphs(self) -> None:
         """Skip CUDA graph capture on Ascend.
 
