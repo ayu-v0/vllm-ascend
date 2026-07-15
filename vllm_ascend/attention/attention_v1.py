@@ -22,8 +22,10 @@ from typing import Literal, NamedTuple
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
+import vllm_ascend.envs as envs_ascend
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -76,6 +78,53 @@ _ATTN_KEYS_BUFFER = None
 FIA_TND_SUPPORTED_HEAD_SIZES = {64, 128, 192}
 
 GraphParamKind = Literal["paged_attention", "fia"]
+logger = init_logger(__name__)
+_GEMMA4_MTP_DEBUG = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_DEBUG
+
+
+def _debug_shape(value: object) -> tuple[int, ...] | None:
+    if torch.is_tensor(value):
+        return tuple(value.shape)
+    return None
+
+
+def _debug_preview(value: object, max_items: int = 8) -> object:
+    try:
+        if torch.is_tensor(value):
+            flat = value.detach().flatten()[:max_items].cpu().tolist()
+            return flat
+        if isinstance(value, (list, tuple)):
+            return list(value[:max_items])
+        return value
+    except Exception as exc:
+        return f"<preview failed: {type(exc).__name__}: {exc}>"
+
+
+def _debug_finite_summary(value: object, max_rows: int = 2) -> object:
+    try:
+        if not torch.is_tensor(value):
+            return None
+        rows = value.detach()
+        if rows.dim() > 0:
+            rows = rows[:max_rows]
+        if rows.numel() == 0:
+            return {"shape": tuple(rows.shape), "finite": 0, "total": 0}
+        finite = torch.isfinite(rows)
+        finite_count = int(finite.sum().item())
+        summary: dict[str, object] = {
+            "shape": tuple(rows.shape),
+            "finite": finite_count,
+            "total": int(rows.numel()),
+            "nan": int(torch.isnan(rows).sum().item()),
+            "inf": int(torch.isinf(rows).sum().item()),
+        }
+        if finite_count:
+            finite_rows = rows[finite].float()
+            summary["min"] = float(finite_rows.min().item())
+            summary["max"] = float(finite_rows.max().item())
+        return summary
+    except Exception as exc:
+        return f"<finite failed: {type(exc).__name__}: {exc}>"
 
 
 class AttentionGraphParam(NamedTuple):
@@ -1318,6 +1367,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_metadata,
             num_tokens,
         )
+        if _GEMMA4_MTP_DEBUG and self.kv_sharing_target_layer_name is not None:
+            logger.warning(
+                "Gemma4 MTP debug: shared_kv_prefill dense_kv "
+                "layer=%s target=%s query_shape=%s key_shape=%s "
+                "value_shape=%s actual_seq_q=%s actual_seq_kv=%s "
+                "seq_lens=%s key_finite=%s value_finite=%s",
+                getattr(self, "_layer_name", None),
+                self.kv_sharing_target_layer_name,
+                _debug_shape(query),
+                _debug_shape(key),
+                _debug_shape(value),
+                attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_kv,
+                _debug_preview(attn_metadata.seq_lens_list),
+                _debug_finite_summary(key),
+                _debug_finite_summary(value),
+            )
         sparse_mode = 4 if self.sliding_window is not None else 3 if attn_metadata.causal else 0
         pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
         next_tokens = 0 if attn_metadata.causal or self.sliding_window is not None else SWA_INT_MAX
@@ -1338,6 +1404,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_kvlen=actual_seq_lengths_kv,
             sparse_mode=sparse_mode,
         )[0]
+        if _GEMMA4_MTP_DEBUG and self.kv_sharing_target_layer_name is not None:
+            logger.warning(
+                "Gemma4 MTP debug: shared_kv_prefill output "
+                "layer=%s target=%s attn_output_shape=%s "
+                "attn_output_finite=%s",
+                getattr(self, "_layer_name", None),
+                self.kv_sharing_target_layer_name,
+                _debug_shape(attn_output),
+                _debug_finite_summary(attn_output),
+            )
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 
@@ -1487,14 +1563,62 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
-        if (
+        shared_kv_prefill = (
             self.kv_sharing_target_layer_name is not None
             and key is not None
             and value is not None
             and query.shape[0] == key.shape[0]
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
-        ):
+        )
+        if shared_kv_prefill:
+            shared_cache_available = (
+                self.key_cache is not None and self.value_cache is not None
+            )
+            if _GEMMA4_MTP_DEBUG:
+                logger.warning(
+                    "Gemma4 MTP debug: shared_kv_prefill enter "
+                    "layer=%s target=%s attn_state=%s query_shape=%s "
+                    "key_shape=%s value_shape=%s shared_cache_available=%s "
+                    "slot_mapping_shape=%s slot_mapping_preview=%s "
+                    "actual_seq_q=%s seq_lens=%s block_tables_shape=%s",
+                    getattr(self, "_layer_name", None),
+                    self.kv_sharing_target_layer_name,
+                    getattr(attn_metadata.attn_state, "name", attn_metadata.attn_state),
+                    _debug_shape(query),
+                    _debug_shape(key),
+                    _debug_shape(value),
+                    shared_cache_available,
+                    _debug_shape(attn_metadata.slot_mapping),
+                    _debug_preview(attn_metadata.slot_mapping),
+                    attn_metadata.actual_seq_lengths_q,
+                    _debug_preview(attn_metadata.seq_lens_list),
+                    _debug_shape(attn_metadata.block_tables),
+                )
             shared_key, shared_value = self._get_current_token_shared_kv(attn_metadata)
+            if _GEMMA4_MTP_DEBUG:
+                logger.warning(
+                    "Gemma4 MTP debug: shared_kv_prefill current_token_kv "
+                    "layer=%s target=%s current_key_shape=%s "
+                    "current_value_shape=%s current_key_finite=%s "
+                    "current_value_finite=%s",
+                    getattr(self, "_layer_name", None),
+                    self.kv_sharing_target_layer_name,
+                    _debug_shape(shared_key),
+                    _debug_shape(shared_value),
+                    _debug_finite_summary(shared_key),
+                    _debug_finite_summary(shared_value),
+                )
+            if (
+                attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
+                and shared_cache_available
+            ):
+                return self._forward_large_head_prefill_attention(
+                    query,
+                    shared_key if shared_key is not None else key,
+                    shared_value if shared_value is not None else value,
+                    attn_metadata,
+                    output,
+                )
             if shared_key is not None and shared_value is not None:
                 return self._forward_large_head_prefill_attention(
                     query,
