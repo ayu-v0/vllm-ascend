@@ -240,6 +240,74 @@ def _debug_topk_preview(
         return f"<topk failed: {type(exc).__name__}: {exc}>", None
 
 
+def _debug_finite_summary(
+    value: torch.Tensor | None,
+    row_indices: torch.Tensor | None = None,
+    max_rows: int = 2,
+) -> Any:
+    if value is None or not torch.is_tensor(value):
+        return None
+    try:
+        if row_indices is None:
+            rows = value.detach()[:max_rows]
+        else:
+            row_indices = row_indices[:max_rows].to(
+                device=value.device, dtype=torch.long
+            )
+            if row_indices.numel() == 0:
+                return []
+            rows = value.detach().index_select(0, row_indices)
+        if rows.numel() == 0:
+            return {"shape": tuple(rows.shape), "finite": 0, "total": 0}
+        finite = torch.isfinite(rows)
+        finite_count = int(finite.sum().item())
+        total = rows.numel()
+        summary: dict[str, Any] = {
+            "shape": tuple(rows.shape),
+            "finite": finite_count,
+            "total": total,
+            "nan": int(torch.isnan(rows).sum().item()),
+            "inf": int(torch.isinf(rows).sum().item()),
+        }
+        if finite_count:
+            finite_rows = rows[finite].float()
+            summary["min"] = float(finite_rows.min().item())
+            summary["max"] = float(finite_rows.max().item())
+        return summary
+    except Exception as exc:
+        return f"<finite failed: {type(exc).__name__}: {exc}>"
+
+
+def _debug_attn_metadata_preview(attn_metadata: PerLayerAttnMetadata | None) -> Any:
+    if attn_metadata is None:
+        return None
+    try:
+        if isinstance(attn_metadata, list):
+            metadata_dict = next((item for item in attn_metadata if item), None)
+            if metadata_dict is None:
+                return []
+        else:
+            metadata_dict = attn_metadata
+        metadata = next(iter(metadata_dict.values()), None)
+        if metadata is None:
+            return {}
+        attn_state = getattr(metadata, "attn_state", None)
+        return {
+            "attn_state": getattr(attn_state, "name", str(attn_state)),
+            "actual_seq_lengths_q": getattr(metadata, "actual_seq_lengths_q", None),
+            "seq_lens_list": getattr(metadata, "seq_lens_list", None),
+            "max_query_len": getattr(metadata, "max_query_len", None),
+            "slot_mapping_preview": _debug_token_preview(
+                getattr(metadata, "slot_mapping", None)
+            ),
+            "block_tables_preview": _debug_token_preview(
+                getattr(metadata, "block_tables", None)
+            ),
+        }
+    except Exception as exc:
+        return f"<attn metadata failed: {type(exc).__name__}: {exc}>"
+
+
 def _gemma4_mtp_debug_enabled(drafter: Any) -> bool:
     return _GEMMA4_MTP_DEBUG and isinstance(drafter, AscendGemma4Proposer)
 
@@ -2140,7 +2208,8 @@ class NPUModelRunner(GPUModelRunner):
                     "metadata_draft_shape=%s metadata_draft_preview=%s "
                     "target_logits_indices_preview=%s "
                     "bonus_logits_indices_preview=%s "
-                    "scheduled_spec_decode_tokens=%s",
+                    "scheduled_spec_decode_tokens=%s "
+                    "attn_metadata=%s",
                     _debug_shape(input_ids),
                     _debug_token_preview(input_ids),
                     _debug_shape(positions),
@@ -2156,6 +2225,7 @@ class NPUModelRunner(GPUModelRunner):
                         spec_decode_metadata.bonus_logits_indices
                     ),
                     scheduler_output.scheduled_spec_decode_tokens,
+                    _debug_attn_metadata_preview(attn_metadata),
                 )
 
         if self.dynamic_eplb:
@@ -2268,6 +2338,22 @@ class NPUModelRunner(GPUModelRunner):
                 spec_decode_metadata is not None
                 and _gemma4_mtp_debug_enabled(self.drafter)
             ):
+                target_hidden_finite = _debug_finite_summary(
+                    sample_hidden_states,
+                    spec_decode_metadata.target_logits_indices,
+                )
+                bonus_hidden_finite = _debug_finite_summary(
+                    sample_hidden_states,
+                    spec_decode_metadata.bonus_logits_indices,
+                )
+                target_logits_finite = _debug_finite_summary(
+                    logits,
+                    spec_decode_metadata.target_logits_indices,
+                )
+                bonus_logits_finite = _debug_finite_summary(
+                    logits,
+                    spec_decode_metadata.bonus_logits_indices,
+                )
                 target_top_ids, target_top_values = _debug_topk_preview(
                     logits, spec_decode_metadata.target_logits_indices
                 )
@@ -2277,10 +2363,16 @@ class NPUModelRunner(GPUModelRunner):
                 logger.warning(
                     "Gemma4 MTP debug: target_verify_logits "
                     "sample_hidden_states_shape=%s logits_shape=%s "
+                    "target_hidden_finite=%s bonus_hidden_finite=%s "
+                    "target_logits_finite=%s bonus_logits_finite=%s "
                     "target_top_ids=%s target_top_values=%s "
                     "bonus_top_ids=%s bonus_top_values=%s",
                     _debug_shape(sample_hidden_states),
                     _debug_shape(logits),
+                    target_hidden_finite,
+                    bonus_hidden_finite,
+                    target_logits_finite,
+                    bonus_logits_finite,
                     target_top_ids,
                     target_top_values,
                     bonus_top_ids,

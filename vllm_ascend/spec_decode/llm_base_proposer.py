@@ -158,6 +158,61 @@ def _debug_topk_preview(
         return f"<topk failed: {type(exc).__name__}: {exc}>", None
 
 
+def _debug_finite_summary(
+    value: torch.Tensor | None,
+    max_rows: int = 2,
+) -> Any:
+    if value is None or not torch.is_tensor(value):
+        return None
+    try:
+        rows = value.detach()[:max_rows]
+        if rows.numel() == 0:
+            return {"shape": tuple(rows.shape), "finite": 0, "total": 0}
+        finite = torch.isfinite(rows)
+        finite_count = int(finite.sum().item())
+        total = rows.numel()
+        summary: dict[str, Any] = {
+            "shape": tuple(rows.shape),
+            "finite": finite_count,
+            "total": total,
+            "nan": int(torch.isnan(rows).sum().item()),
+            "inf": int(torch.isinf(rows).sum().item()),
+        }
+        if finite_count:
+            finite_rows = rows[finite].float()
+            summary["min"] = float(finite_rows.min().item())
+            summary["max"] = float(finite_rows.max().item())
+        return summary
+    except Exception as exc:
+        return f"<finite failed: {type(exc).__name__}: {exc}>"
+
+
+def _debug_sparse_top_preview(
+    model: nn.Module,
+    hidden_states: torch.Tensor,
+    max_rows: int = 2,
+    k: int = 8,
+) -> tuple[Any, Any]:
+    masked_embedding = getattr(model, "masked_embedding", None)
+    if masked_embedding is None or not hasattr(masked_embedding, "_select_and_score"):
+        return None, None
+    try:
+        lm_head_weight = model._get_full_lm_head_weight()
+        logits, indices = masked_embedding._select_and_score(
+            hidden_states[:max_rows], lm_head_weight
+        )
+        if logits.numel() == 0:
+            return [], []
+        top_k = min(k, logits.shape[-1])
+        top_values, top_local_ids = torch.topk(logits.float(), k=top_k, dim=-1)
+        top_ids = indices.gather(-1, top_local_ids)
+        return _debug_token_preview(top_ids, max_rows, k), _debug_token_preview(
+            top_values, max_rows, k
+        )
+    except Exception as exc:
+        return f"<sparse top failed: {type(exc).__name__}: {exc}>", None
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
@@ -1195,15 +1250,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if use_gemma4_mtp_debug:
             inner_model = getattr(self.model, "model", None)
+            draft_sparse_top_ids, draft_sparse_top_values = (
+                _debug_sparse_top_preview(self.model, sample_hidden_states)
+                if use_gemma4_mtp
+                else (None, None)
+            )
             logger.warning(
                 "Gemma4 MTP debug: _run_merged_draft logits start "
                 "sample_hidden_states_shape=%s num_indices=%s "
-                "enable_reduce_sample=%s has_compute_logits=%s lmhead_tp=%s",
+                "enable_reduce_sample=%s has_compute_logits=%s lmhead_tp=%s "
+                "draft_hidden_finite=%s draft_sparse_top_ids=%s "
+                "draft_sparse_top_values=%s",
                 _debug_shape(sample_hidden_states),
                 num_indices,
                 get_ascend_config().enable_reduce_sample,
                 hasattr(inner_model, "compute_logits"),
                 lmhead_tp_enable(),
+                _debug_finite_summary(sample_hidden_states),
+                draft_sparse_top_ids,
+                draft_sparse_top_values,
             )
         if use_gemma4_mtp:
             draft_token_ids = self._greedy_sample(sample_hidden_states)

@@ -83,6 +83,9 @@ def test_gemma4_mtp_draft_logits_logs_token_preview_and_topk():
     assert "draft_token_ids_preview=%s" in base_source
     assert "draft_top_ids=%s" in base_source
     assert "draft_top_values=%s" in base_source
+    assert "draft_hidden_finite=%s" in base_source
+    assert "draft_sparse_top_ids=%s" in base_source
+    assert "draft_sparse_top_values=%s" in base_source
 
 
 def test_gemma4_mtp_uses_specialized_greedy_sampling_for_draft_tokens():

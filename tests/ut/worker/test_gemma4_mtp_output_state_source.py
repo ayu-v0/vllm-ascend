@@ -46,7 +46,12 @@ def test_gemma4_mtp_logs_target_verification_inputs_and_logits():
     assert "input_ids_preview=%s" in text
     assert "positions_preview=%s" in text
     assert "metadata_draft_preview=%s" in text
+    assert "attn_metadata=%s" in text
     assert "Gemma4 MTP debug: target_verify_logits" in text
+    assert "target_hidden_finite=%s" in text
+    assert "bonus_hidden_finite=%s" in text
+    assert "target_logits_finite=%s" in text
+    assert "bonus_logits_finite=%s" in text
     assert "target_top_ids=%s" in text
     assert "target_top_values=%s" in text
 
