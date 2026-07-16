@@ -68,6 +68,63 @@ class AscendGemma4Proposer(Gemma4Proposer, AscendSpecDecodeBaseProposer):
                 target_layer_name,
             )
 
+    def build_constant_position_multi_step_metadata(
+        self,
+        common_attn_metadata,
+        initial_per_layer_attn_metadata: dict[str, object],
+        batch_size: int,
+        num_input_tokens: int,
+        used_update_positions: torch.Tensor,
+        aclgraph_runtime_mode,
+        ori_seq_len=None,
+        slot_indices=None,
+        mtp_slot_mapping=None,
+    ) -> list[dict[str, object]]:
+        """Build Gemma4 draft metadata without advancing target state.
+
+        Gemma4 assistant steps reuse the last target position. Each attention
+        group owns a distinct KV block table, so its metadata must be built
+        independently and retained for only that group's layers.
+        """
+        multi_steps_attn_metadata: list[dict[str, object]] = []
+        step_slot_indices = slot_indices
+
+        for draft_step in range(1, self.num_speculative_tokens):
+            per_layer_attn_metadata: dict[str, object] = {}
+            for attn_group in self.draft_attn_groups:
+                group_common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+                group_id = attn_group.kv_cache_group_id
+                group_block_table = self._per_group_block_tables.get(group_id)
+                if group_block_table is not None:
+                    group_common_attn_metadata.block_table_tensor = group_block_table[:batch_size]
+
+                first_layer_name = attn_group.layer_names[0]
+                _, attn_metadata = self.attn_update_stack_num_spec_norm(
+                    draft_step,
+                    initial_per_layer_attn_metadata[first_layer_name],
+                    group_common_attn_metadata,
+                    batch_size,
+                    num_input_tokens,
+                    used_update_positions.clone(),
+                    aclgraph_runtime_mode,
+                    ori_seq_len,
+                    None if step_slot_indices is None else step_slot_indices.clone(),
+                    mtp_slot_mapping,
+                    attn_group=attn_group,
+                    keep_positions_and_seq_lens=True,
+                )
+                # The Ascend builder retains a view into slot_mapping_group.
+                # Preserve this group's mapping before the next group updates it.
+                attn_metadata.slot_mapping = attn_metadata.slot_mapping.clone()
+                for layer_name in attn_group.layer_names:
+                    per_layer_attn_metadata[layer_name] = attn_metadata
+
+            multi_steps_attn_metadata.append(per_layer_attn_metadata)
+            if step_slot_indices is not None:
+                step_slot_indices = step_slot_indices + self.pcp_size
+
+        return multi_steps_attn_metadata
+
     def _setup_centroids_cuda_graphs(self) -> None:
         """Skip CUDA graph capture on Ascend.
 

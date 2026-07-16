@@ -115,6 +115,24 @@ def test_run_merged_draft_initializes_gemma4_mtp_flag_before_use():
     assert source.index(init) < source.index(use)
 
 
+def test_gemma4_mtp_uses_constant_position_multistep_metadata_helper():
+    base_propose = _method_source_from(BASE_SOURCE, "_propose")
+    gemma_helper = _method_source("build_constant_position_multi_step_metadata")
+
+    assert "if use_gemma4_mtp:" in base_propose
+    assert "build_constant_position_multi_step_metadata" in base_propose
+    assert "for layer_name in attn_group.layer_names:" in gemma_helper
+    assert "keep_positions_and_seq_lens=True" in gemma_helper
+
+
+def test_gemma4_mtp_constant_metadata_does_not_mutate_position_input():
+    source = _method_source_from(BASE_SOURCE, "attn_update_stack_num_spec_norm")
+
+    assert "keep_positions_and_seq_lens: bool = False" in source
+    assert "next_positions = used_update_positions.clone()" in source
+    assert "used_update_positions += 1" not in source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
     test_ascend_gemma4_uses_sparse_top_tokens_without_cuda_graphs()
@@ -124,3 +142,5 @@ if __name__ == "__main__":
     test_gemma4_mtp_draft_logits_logs_token_preview_and_topk()
     test_gemma4_mtp_uses_specialized_greedy_sampling_for_draft_tokens()
     test_run_merged_draft_initializes_gemma4_mtp_flag_before_use()
+    test_gemma4_mtp_uses_constant_position_multistep_metadata_helper()
+    test_gemma4_mtp_constant_metadata_does_not_mutate_position_input()

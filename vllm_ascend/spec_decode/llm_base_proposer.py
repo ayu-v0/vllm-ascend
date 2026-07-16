@@ -998,6 +998,61 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
                 # Copy the old attn_metadata and update
                 if not self.parallel_drafting:
+                    if use_gemma4_mtp:
+                        helper = getattr(self, "build_constant_position_multi_step_metadata", None)
+                        if helper is None:
+                            raise RuntimeError("Gemma4 MTP multi-step metadata helper is not available")
+                        multi_steps_attn_metadata.extend(
+                            helper(
+                                common_attn_metadata,
+                                per_layer_attn_metadata,
+                                batch_size,
+                                num_input_tokens,
+                                used_update_positions,
+                                aclgraph_runtime_mode,
+                                ori_seq_len,
+                                slot_indices,
+                                mtp_slot_mapping,
+                            )
+                        )
+                    else:
+                        for draft_step in range(1, self.num_speculative_tokens):
+                            per_layer_attn_metadata = dict()
+                            for attn_group in self.draft_attn_groups:
+                                common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
+                                    draft_step,
+                                    attn_metadata,
+                                    common_attn_metadata,
+                                    batch_size,
+                                    num_input_tokens,
+                                    used_update_positions,
+                                    aclgraph_runtime_mode,
+                                    ori_seq_len,
+                                    slot_indices,
+                                    mtp_slot_mapping,
+                                    attn_group=attn_group,
+                                )
+                                for layer_name in self.attn_layer_names:
+                                    per_layer_attn_metadata[layer_name] = attn_metadata
+                            multi_steps_attn_metadata.append(per_layer_attn_metadata)
+        else:
+            # Copy the old attn_metadata and update
+            if not self.parallel_drafting:
+                if use_gemma4_mtp:
+                    helper = getattr(self, "build_constant_position_multi_step_metadata", None)
+                    if helper is None:
+                        raise RuntimeError("Gemma4 MTP multi-step metadata helper is not available")
+                    multi_steps_attn_metadata.extend(
+                        helper(
+                            common_attn_metadata,
+                            per_layer_attn_metadata,
+                            batch_size,
+                            num_input_tokens,
+                            used_update_positions,
+                            aclgraph_runtime_mode,
+                        )
+                    )
+                else:
                     for draft_step in range(1, self.num_speculative_tokens):
                         per_layer_attn_metadata = dict()
                         for attn_group in self.draft_attn_groups:
@@ -1009,33 +1064,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                                 num_input_tokens,
                                 used_update_positions,
                                 aclgraph_runtime_mode,
-                                ori_seq_len,
-                                slot_indices,
-                                mtp_slot_mapping,
                                 attn_group=attn_group,
                             )
                             for layer_name in self.attn_layer_names:
                                 per_layer_attn_metadata[layer_name] = attn_metadata
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
-        else:
-            # Copy the old attn_metadata and update
-            if not self.parallel_drafting:
-                for draft_step in range(1, self.num_speculative_tokens):
-                    per_layer_attn_metadata = dict()
-                    for attn_group in self.draft_attn_groups:
-                        common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
-                            draft_step,
-                            attn_metadata,
-                            common_attn_metadata,
-                            batch_size,
-                            num_input_tokens,
-                            used_update_positions,
-                            aclgraph_runtime_mode,
-                            attn_group=attn_group,
-                        )
-                        for layer_name in self.attn_layer_names:
-                            per_layer_attn_metadata[layer_name] = attn_metadata
-                    multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
@@ -1706,6 +1739,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         slot_indices=None,
         mtp_slot_mapping=None,
         attn_group=None,
+        keep_positions_and_seq_lens: bool = False,
     ):
         assert draft_step > 0
         assert attn_group is not None, "vllm-ascend v0.17.0rc1 requires attn_group"
@@ -1748,8 +1782,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.graph_pad_size = -1
             common_attn_metadata.num_input_tokens = input_batch_size
 
-        # The loop part
-        used_update_positions += 1
+        # Gemma4 assistant predicts every draft token from the last target
+        # position. Other speculative methods retain the existing increment.
+        if keep_positions_and_seq_lens:
+            next_positions = used_update_positions.clone()
+        else:
+            next_positions = used_update_positions.add(1)
 
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
@@ -1770,34 +1808,35 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # out-of-range access during the model execution. The draft tokens
         # generated with this adjustment should be ignored.
         if self.uses_mrope:
-            exceeds_max_model_len = used_update_positions[0] >= self.max_model_len
+            exceeds_max_model_len = next_positions[0] >= self.max_model_len
             # Mask out the position ids that exceed the max model length.
             # Otherwise, we may get out-of-range error in RoPE.
             clamped_positions = torch.where(
-                exceeds_max_model_len.unsqueeze(0), torch.zeros_like(used_update_positions), used_update_positions
+                exceeds_max_model_len.unsqueeze(0), torch.zeros_like(next_positions), next_positions
             )
         else:
-            exceeds_max_model_len = used_update_positions >= self.max_model_len
-            clamped_positions = torch.where(exceeds_max_model_len, 0, used_update_positions)
+            exceeds_max_model_len = next_positions >= self.max_model_len
+            clamped_positions = torch.where(exceeds_max_model_len, 0, next_positions)
 
         # For data integrity when async scheduling, we shouldn't use in place
         # operations in case they are modified in next step's `prepare_input`
         # of main model.
-        # Increment the sequence lengths.
-        common_attn_metadata.seq_lens[:batch_size] += 1
-        # For the requests that exceed the max model length, we set the
-        # sequence length to 1 to minimize their overheads in attention.
-        common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_max_model_len, 1)
-        if common_attn_metadata.seq_lens_cpu is not None:
-            common_attn_metadata.seq_lens_cpu[:batch_size] = common_attn_metadata.seq_lens_cpu[:batch_size] + 1
-            exceeds_mask = common_attn_metadata.seq_lens_cpu[:batch_size] >= self.max_model_len
-            common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask, 1)
-        if common_attn_metadata._seq_lens_cpu is not None:
-            common_attn_metadata._seq_lens_cpu[:batch_size] = common_attn_metadata._seq_lens_cpu[:batch_size] + 1
-            exceeds_mask_internal = common_attn_metadata._seq_lens_cpu[:batch_size] >= self.max_model_len
-            common_attn_metadata._seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_internal, 1)
-        if common_attn_metadata.num_computed_tokens_cpu is not None:
-            common_attn_metadata.num_computed_tokens_cpu[:batch_size] += 1
+        if not keep_positions_and_seq_lens:
+            # Increment the sequence lengths.
+            common_attn_metadata.seq_lens[:batch_size] += 1
+            # For requests exceeding max_model_len, use the shortest valid
+            # sequence length to minimize attention work.
+            common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_max_model_len, 1)
+            if common_attn_metadata.seq_lens_cpu is not None:
+                common_attn_metadata.seq_lens_cpu[:batch_size] = common_attn_metadata.seq_lens_cpu[:batch_size] + 1
+                exceeds_mask = common_attn_metadata.seq_lens_cpu[:batch_size] >= self.max_model_len
+                common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask, 1)
+            if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu[:batch_size] = common_attn_metadata._seq_lens_cpu[:batch_size] + 1
+                exceeds_mask_internal = common_attn_metadata._seq_lens_cpu[:batch_size] >= self.max_model_len
+                common_attn_metadata._seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_internal, 1)
+            if common_attn_metadata.num_computed_tokens_cpu is not None:
+                common_attn_metadata.num_computed_tokens_cpu[:batch_size] += 1
         if self.uses_mrope:
             common_attn_metadata.positions[:batch_size].copy_(clamped_positions[0])
         else:
