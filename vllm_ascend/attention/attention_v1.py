@@ -1459,7 +1459,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         max_seq_len = int(seq_lens_tensor.max().item())
         num_blocks = cdiv(max_seq_len, block_size)
         input_block_table_shape = _debug_shape(block_table)
-        block_table = block_table[: len(seq_lens), :num_blocks].long()
+        # The runner reuses the source block-table buffer on subsequent
+        # scheduler steps. Keep an NPU-owned snapshot for the asynchronous
+        # gather so its indices cannot be mutated after this forward is queued.
+        block_table = block_table[: len(seq_lens), :num_blocks].long().clone()
 
         flat_block_ids = block_table.reshape(-1)
         if _GEMMA4_MTP_DEBUG and flat_block_ids.numel():

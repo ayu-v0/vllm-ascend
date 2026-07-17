@@ -82,6 +82,12 @@ def test_gemma4_mtp_logs_paged_kv_gather_bounds():
     assert "paged KV block id is out of range" in source
 
 
+def test_gemma4_mtp_gather_owns_block_id_tensor():
+    source = (SOURCE.parents[1] / "attention" / "attention_v1.py").read_text(encoding="utf-8")
+
+    assert "block_table = block_table[: len(seq_lens), :num_blocks].long().clone()" in source
+
+
 def test_gemma4_mtp_passes_current_count_to_async_output_only():
     source = _method_source("sample_tokens")
 
@@ -98,4 +104,5 @@ if __name__ == "__main__":
     test_gemma4_mtp_logs_target_verification_inputs_and_logits()
     test_gemma4_mtp_logs_async_state_handoff_boundaries()
     test_gemma4_mtp_logs_paged_kv_gather_bounds()
+    test_gemma4_mtp_gather_owns_block_id_tensor()
     test_gemma4_mtp_passes_current_count_to_async_output_only()
