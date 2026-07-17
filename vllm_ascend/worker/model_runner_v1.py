@@ -1517,7 +1517,19 @@ class NPUModelRunner(GPUModelRunner):
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
+        use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.drafter)
         if self.valid_sampled_token_count_event is None:
+            if use_gemma4_mtp_debug:
+                logger.warning(
+                    "Gemma4 MTP async trace: valid-count copy skipped "
+                    "reason=no_event async_scheduling=%s async_spec_decode=%s "
+                    "counts_shape=%s next_token_ids_shape=%s req_ids=%s",
+                    self.use_async_scheduling,
+                    self.use_async_spec_decode,
+                    _debug_shape(valid_sampled_tokens_count),
+                    _debug_shape(next_token_ids),
+                    self.input_batch.req_ids,
+                )
             return
 
         # Initialize a new stream to overlap the copy operation with
@@ -1530,6 +1542,25 @@ class NPUModelRunner(GPUModelRunner):
             assert counts_cpu is not None
             counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
             self.valid_sampled_token_count_event.record()
+
+        if use_gemma4_mtp_debug:
+            trace_id = getattr(self, "_gemma4_mtp_async_trace_id", 0) + 1
+            self._gemma4_mtp_async_trace_id = trace_id
+            logger.warning(
+                "Gemma4 MTP async trace: valid-count copy "
+                "trace_id=%s async_scheduling=%s async_spec_decode=%s "
+                "counts_shape=%s counts_device=%s counts_cpu_id=%s "
+                "count_event_id=%s next_token_ids_shape=%s req_ids=%s",
+                trace_id,
+                self.use_async_scheduling,
+                self.use_async_spec_decode,
+                _debug_shape(counts),
+                counts.device,
+                id(counts_cpu),
+                id(self.valid_sampled_token_count_event),
+                _debug_shape(next_token_ids),
+                self.input_batch.req_ids,
+            )
 
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
@@ -2541,6 +2572,24 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 if use_gemma4_mtp_debug:
                     logger.warning(
+                        "Gemma4 MTP async trace: sampling path "
+                        "async_scheduling=%s async_spec_decode=%s method=%s "
+                        "use_eagle=%s use_gemma4_mtp=%s use_padded_batch=%s "
+                        "disable_padded_drafter_batch=%s input_fits_in_drafter=%s "
+                        "num_reqs=%s num_spec_tokens=%s",
+                        self.use_async_scheduling,
+                        self.use_async_spec_decode,
+                        self.speculative_config.method,
+                        self.speculative_config.use_eagle(),
+                        self.speculative_config.use_gemma4_mtp(),
+                        use_padded_batch,
+                        self.speculative_config.disable_padded_drafter_batch,
+                        input_fits_in_drafter,
+                        self.input_batch.num_reqs,
+                        self.num_spec_tokens,
+                    )
+                if use_gemma4_mtp_debug:
+                    logger.warning(
                         "Gemma4 MTP debug: draft_token stage "
                         "input_fits_in_drafter=%s use_padded_batch=%s "
                         "common_attn_metadata=%s sampled_token_ids_shape=%s "
@@ -2667,6 +2716,11 @@ class NPUModelRunner(GPUModelRunner):
                 sampler_output.logprobs_tensors is not None,
                 invalid_req_indices,
             )
+        valid_sampled_token_count = (
+            self.valid_sampled_token_count_gpu
+            if isinstance(self.drafter, AscendGemma4Proposer)
+            else None
+        )
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -2674,6 +2728,7 @@ class NPUModelRunner(GPUModelRunner):
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
+            valid_sampled_token_count=valid_sampled_token_count,
         )
         if use_gemma4_mtp_debug:
             logger.warning(
@@ -2687,10 +2742,27 @@ class NPUModelRunner(GPUModelRunner):
         )
         if use_gemma4_mtp_debug:
             logger.warning(
-                "Gemma4 MTP debug: async output return "
-                "stored_async_event=%s stored_sampled_token_ids_cpu=%s",
+                "Gemma4 MTP async trace: output handoff "
+                "trace_id=%s req_ids=%s req_id_to_index=%s "
+                "stored_async_event=%s stored_sampled_token_ids_cpu=%s "
+                "valid_count_gpu_shape=%s valid_count_cpu_id=%s count_event_id=%s "
+                "output_count_snapshot_id=%s output_count_cpu_id=%s",
+                getattr(self, "_gemma4_mtp_async_trace_id", None),
+                req_ids_output_copy,
+                req_id_to_index_output_copy,
                 self.input_batch.async_copy_ready_event is not None,
                 _debug_shape(self.input_batch.sampled_token_ids_cpu),
+                _debug_shape(self.valid_sampled_token_count_gpu),
+                id(self.valid_sampled_token_count_cpu)
+                if self.valid_sampled_token_count_cpu is not None
+                else None,
+                id(self.valid_sampled_token_count_event)
+                if self.valid_sampled_token_count_event is not None
+                else None,
+                id(valid_sampled_token_count) if valid_sampled_token_count is not None else None,
+                id(async_output.valid_sampled_token_count_cpu)
+                if async_output.valid_sampled_token_count_cpu is not None
+                else None,
             )
         return async_output
 

@@ -56,8 +56,32 @@ def test_gemma4_mtp_logs_target_verification_inputs_and_logits():
     assert "target_top_values=%s" in text
 
 
+def test_gemma4_mtp_logs_async_state_handoff_boundaries():
+    sample_source = _method_source("sample_tokens")
+    count_copy_source = _method_source("_copy_valid_sampled_token_count")
+
+    assert "Gemma4 MTP async trace: sampling path" in sample_source
+    assert "use_padded_batch=%s" in sample_source
+    assert "Gemma4 MTP async trace: valid-count copy" in count_copy_source
+    assert "trace_id=%s" in count_copy_source
+    assert "counts_cpu_id=%s" in count_copy_source
+    assert "count_event_id=%s" in count_copy_source
+    assert "output_count_cpu_id=%s" in sample_source
+
+
+def test_gemma4_mtp_passes_current_count_to_async_output_only():
+    source = _method_source("sample_tokens")
+
+    assert "valid_sampled_token_count = (" in source
+    assert "valid_sampled_token_count=valid_sampled_token_count" in source
+    assert "isinstance(self.drafter, AscendGemma4Proposer)" in source
+    assert "self.valid_sampled_token_count_gpu" in source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_enables_accepted_token_state_updates()
     test_gemma4_mtp_keeps_async_output_async_by_default()
     test_gemma4_mtp_takes_draft_tokens_without_async_event_wait()
     test_gemma4_mtp_logs_target_verification_inputs_and_logits()
+    test_gemma4_mtp_logs_async_state_handoff_boundaries()
+    test_gemma4_mtp_passes_current_count_to_async_output_only()
