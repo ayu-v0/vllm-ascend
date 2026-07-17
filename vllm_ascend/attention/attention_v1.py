@@ -1458,9 +1458,49 @@ class AscendAttentionBackendImpl(AttentionImpl):
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.long, device=key_cache.device)
         max_seq_len = int(seq_lens_tensor.max().item())
         num_blocks = cdiv(max_seq_len, block_size)
+        input_block_table_shape = _debug_shape(block_table)
         block_table = block_table[: len(seq_lens), :num_blocks].long()
 
         flat_block_ids = block_table.reshape(-1)
+        if _GEMMA4_MTP_DEBUG and flat_block_ids.numel():
+            # This path is only used by Gemma4's large-head shared-KV fallback.
+            # Materialize the small block-id vector on CPU before index_select so
+            # an invalid mapping is reported with its ownership context instead
+            # of surfacing later as an asynchronous NPU gather failure.
+            flat_block_ids_cpu = flat_block_ids.detach().cpu()
+            flat_block_id_min = int(flat_block_ids_cpu.min().item())
+            flat_block_id_max = int(flat_block_ids_cpu.max().item())
+            cache_block_capacity = key_cache.shape[0]
+            logger.warning(
+                "Gemma4 MTP debug: paged_kv_gather "
+                "layer=%s target=%s key_cache_shape=%s value_cache_shape=%s "
+                "block_table_shape=%s selected_block_table_shape=%s "
+                "block_size=%s num_blocks=%s seq_lens=%s "
+                "flat_block_id_min=%s flat_block_id_max=%s "
+                "cache_block_capacity=%s",
+                getattr(self, "_layer_name", None),
+                self.kv_sharing_target_layer_name,
+                _debug_shape(key_cache),
+                _debug_shape(value_cache),
+                input_block_table_shape,
+                _debug_shape(block_table),
+                block_size,
+                num_blocks,
+                _debug_preview(seq_lens),
+                flat_block_id_min,
+                flat_block_id_max,
+                cache_block_capacity,
+            )
+            if flat_block_id_min < 0 or flat_block_id_max >= cache_block_capacity:
+                raise RuntimeError(
+                    "Gemma4 MTP paged KV block id is out of range: "
+                    f"layer={getattr(self, '_layer_name', None)} "
+                    f"target={self.kv_sharing_target_layer_name} "
+                    f"min={flat_block_id_min} max={flat_block_id_max} "
+                    f"cache_block_capacity={cache_block_capacity} "
+                    f"key_cache_shape={tuple(key_cache.shape)} "
+                    f"block_table_shape={tuple(block_table.shape)}"
+                )
         max_tokens_padded = num_blocks * block_size
         dense_shape = (
             len(seq_lens),
