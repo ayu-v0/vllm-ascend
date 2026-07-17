@@ -133,6 +133,12 @@ def test_gemma4_mtp_constant_metadata_does_not_mutate_position_input():
     assert "used_update_positions += 1" not in source
 
 
+def test_gemma4_mtp_reinitializes_metadata_shape_for_every_draft_step():
+    source = _method_source_from(BASE_SOURCE, "attn_update_stack_num_spec_norm")
+
+    assert "if draft_step == 1 or keep_positions_and_seq_lens:" in source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
     test_ascend_gemma4_uses_sparse_top_tokens_without_cuda_graphs()
@@ -144,3 +150,4 @@ if __name__ == "__main__":
     test_run_merged_draft_initializes_gemma4_mtp_flag_before_use()
     test_gemma4_mtp_uses_constant_position_multistep_metadata_helper()
     test_gemma4_mtp_constant_metadata_does_not_mutate_position_input()
+    test_gemma4_mtp_reinitializes_metadata_shape_for_every_draft_step()

@@ -1745,7 +1745,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         assert attn_group is not None, "vllm-ascend v0.17.0rc1 requires attn_group"
         common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
 
-        if draft_step == 1:
+        if draft_step == 1 or keep_positions_and_seq_lens:
             if aclgraph_runtime_mode == CUDAGraphMode.FULL:
                 common_attn_metadata.num_reqs = input_batch_size
                 common_attn_metadata.block_table_tensor = self._adjust_tensor(
