@@ -33,7 +33,6 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 
 # isort: off
@@ -899,31 +898,6 @@ class NPUPlatform(Platform):
                     "the main model's quantization method. Resetting to None."
                 )
                 vllm_config.speculative_config.quantization = None
-
-            use_gemma4_mtp = getattr(vllm_config.speculative_config, "use_gemma4_mtp", None)
-            if (
-                callable(use_gemma4_mtp)
-                and use_gemma4_mtp()
-                and vllm_config.scheduler_config
-                and vllm_config.scheduler_config.async_scheduling is not False
-                and not envs.VLLM_ASCEND_ENABLE_GEMMA4_MTP_ASYNC
-            ):
-                logger.warning(
-                    "Gemma4 MTP does not support async scheduling on Ascend yet. "
-                    "Resetting scheduler_config.async_scheduling to False."
-                )
-                vllm_config.scheduler_config.async_scheduling = False
-            elif (
-                callable(use_gemma4_mtp)
-                and use_gemma4_mtp()
-                and vllm_config.scheduler_config
-                and vllm_config.scheduler_config.async_scheduling is not False
-                and envs.VLLM_ASCEND_ENABLE_GEMMA4_MTP_ASYNC
-            ):
-                logger.warning(
-                    "Gemma4 MTP async scheduling is enabled through an experimental "
-                    "validation path. Do not use this test-only setting in production."
-                )
 
         # ==================== 7. KV Transfer Config ====================
         if vllm_config.kv_transfer_config:

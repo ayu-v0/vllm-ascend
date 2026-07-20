@@ -39,7 +39,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _server_args(port: int) -> list[str]:
+def _server_args(port: int, *, async_scheduling: bool) -> list[str]:
     speculative_config = json.dumps(
         {
             "method": "mtp",
@@ -47,7 +47,7 @@ def _server_args(port: int) -> list[str]:
             "num_speculative_tokens": NUM_SPECULATIVE_TOKENS,
         }
     )
-    return [
+    args = [
         "--host",
         "0.0.0.0",
         "--port",
@@ -58,25 +58,27 @@ def _server_args(port: int) -> list[str]:
         SERVED_MODEL_NAME,
         "--trust-remote-code",
         "--language-model-only",
-        "--async-scheduling",
         "--enable-chunked-prefill",
         "--speculative-config",
         speculative_config,
     ]
+    if async_scheduling:
+        args.append("--async-scheduling")
+    else:
+        args.append("--no-async-scheduling")
+    return args
 
 
 @contextmanager
-def gemma4_mtp_server(*, async_validation_enabled: bool) -> Iterator[RemoteOpenAIServer]:
+def gemma4_mtp_server(*, async_scheduling: bool) -> Iterator[RemoteOpenAIServer]:
     assert MODEL is not None
     port = get_open_port()
-    env = {"VLLM_ASCEND_ENABLE_GEMMA4_MTP_ASYNC": "1" if async_validation_enabled else "0"}
     with RemoteOpenAIServer(
         MODEL,
-        _server_args(port),
+        _server_args(port, async_scheduling=async_scheduling),
         server_host="127.0.0.1",
         server_port=port,
         auto_port=False,
-        env_dict=env,
     ) as server:
         yield server
 
@@ -145,10 +147,10 @@ def _choice_view(completion: dict) -> tuple[list[int], str, str | None]:
 
 def test_greedy_token_ids_match_sync_and_async_without_padding():
     prompt = "请用三句话解释为什么幂等接口可以安全重试。"
-    with gemma4_mtp_server(async_validation_enabled=False) as sync_server:
+    with gemma4_mtp_server(async_scheduling=False) as sync_server:
         sync = _completion(sync_server, prompt)
         sync_max_tokens = _completion(sync_server, prompt, max_tokens=1)
-    with gemma4_mtp_server(async_validation_enabled=True) as async_server:
+    with gemma4_mtp_server(async_scheduling=True) as async_server:
         async_result = _completion(async_server, prompt)
         async_max_tokens = _completion(async_server, prompt, max_tokens=1)
 
@@ -158,7 +160,7 @@ def test_greedy_token_ids_match_sync_and_async_without_padding():
 
 def test_streaming_matches_non_streaming_and_cancel_keeps_server_live():
     prompt = "写一段关于分布式系统幂等性的简短说明。"
-    with gemma4_mtp_server(async_validation_enabled=True) as server:
+    with gemma4_mtp_server(async_scheduling=True) as server:
         non_streaming = _completion(server, prompt)
         streamed_text, finish_reason = _stream_completion(server, prompt)
         assert streamed_text == _choice_view(non_streaming)[1]
@@ -175,7 +177,7 @@ def test_mixed_prefill_decode_requests_complete_without_padding_or_reordering():
     long_prompt = "请逐条列出分布式事务的失败模式和恢复策略。" * 256
     prompts = [long_prompt, long_prompt, "你好", "解释 CAP 定理。", "给出一个 SQL 索引示例。"]
 
-    with gemma4_mtp_server(async_validation_enabled=True) as server:
+    with gemma4_mtp_server(async_scheduling=True) as server:
         with ThreadPoolExecutor(max_workers=len(prompts)) as executor:
             futures = [executor.submit(_completion, server, prompt) for prompt in prompts[:2]]
             time.sleep(0.5)
