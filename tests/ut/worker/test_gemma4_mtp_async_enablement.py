@@ -4,6 +4,14 @@ from pathlib import Path
 
 ENVS_SOURCE = Path(__file__).parents[3] / "vllm_ascend" / "envs.py"
 PLATFORM_SOURCE = Path(__file__).parents[3] / "vllm_ascend" / "platform.py"
+E2E_SOURCE = (
+    Path(__file__).parents[3]
+    / "tests"
+    / "e2e"
+    / "singlecard"
+    / "spec_decode"
+    / "test_gemma4_mtp_async_scheduling.py"
+)
 
 
 def _load_envs_module():
@@ -32,3 +40,11 @@ def test_platform_keeps_the_default_guard_and_has_an_explicit_test_only_bypass()
     assert "experimental " in source
     assert "validation path" in source
     assert "scheduler_config.async_scheduling = False" in source
+
+
+def test_gemma4_mtp_async_e2e_uses_the_expected_network_and_context_window():
+    source = E2E_SOURCE.read_text(encoding="utf-8")
+
+    assert '"--host",\n        "0.0.0.0"' in source
+    assert '"--max-model-len",\n        "32768"' in source
+    assert '"--language-model-only"' in source

@@ -49,12 +49,15 @@ def _server_args(port: int) -> list[str]:
     )
     return [
         "--host",
-        "127.0.0.1",
+        "0.0.0.0",
         "--port",
         str(port),
+        "--max-model-len",
+        "32768",
         "--served-model-name",
         SERVED_MODEL_NAME,
         "--trust-remote-code",
+        "--language-model-only",
         "--async-scheduling",
         "--enable-chunked-prefill",
         "--speculative-config",
