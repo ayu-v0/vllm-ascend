@@ -127,9 +127,11 @@ def _stream_completion(server: RemoteOpenAIServer, prompt: str, *, close_early: 
                 break
             chunk = json.loads(data)
             choice = chunk["choices"][0]
-            text_parts.append(choice.get("delta", {}).get("content") or "")
+            delta_content = choice.get("delta", {}).get("content")
+            if delta_content:
+                text_parts.append(delta_content)
             finish_reason = choice.get("finish_reason") or finish_reason
-            if close_early and text_parts:
+            if close_early and delta_content:
                 break
     finally:
         response.close()

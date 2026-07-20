@@ -48,3 +48,4 @@ def test_gemma4_mtp_async_e2e_uses_the_expected_network_and_context_window():
     assert '"--host",\n        "0.0.0.0"' in source
     assert '"--max-model-len",\n        "32768"' in source
     assert '"--language-model-only"' in source
+    assert "if close_early and delta_content:" in source
