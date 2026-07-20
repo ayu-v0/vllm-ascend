@@ -117,6 +117,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable verbose Gemma4 MTP diagnostics. This is off by default because
     # the diagnostic path logs every decode step and may force CPU/NPU sync.
     "VLLM_ASCEND_GEMMA4_MTP_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_GEMMA4_MTP_DEBUG", "0"))),
+    # Test-only validation bypass for the Gemma4 MTP async scheduling guard.
+    # This must remain disabled by default until the dedicated NPU regressions
+    # prove equivalence with the synchronous path.
+    "VLLM_ASCEND_ENABLE_GEMMA4_MTP_ASYNC": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_GEMMA4_MTP_ASYNC", "0"))
+    ),
 }
 
 # end-env-vars-definition
