@@ -126,6 +126,7 @@ run_mode() {
     --backend openai \
     --base-url "http://127.0.0.1:${BENCHMARK_PORT}" \
     --model "${SERVED_MODEL_NAME}" \
+    --tokenizer "${MODEL}" \
     --dataset-name random \
     --random-input-len "${INPUT_LEN}" \
     --random-output-len "${OUTPUT_LEN}" \

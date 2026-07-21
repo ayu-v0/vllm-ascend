@@ -84,6 +84,7 @@ def test_gemma4_mtp_benchmark_keeps_k_and_workload_constant():
     assert '"--async-scheduling"' in source
     assert "SPECULATIVE_CONFIG" in source
     assert '"k=${NUM_SPECULATIVE_TOKENS}"' in source
+    assert '--tokenizer "${MODEL}"' in source
     for argument, value in (
         ("--seed", "${BENCHMARK_SEED}"),
         ("--num-prompts", "${NUM_PROMPTS}"),
