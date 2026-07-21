@@ -11,6 +11,14 @@ E2E_SOURCE = (
     / "spec_decode"
     / "test_gemma4_mtp_async_scheduling.py"
 )
+BENCHMARK_SCRIPT = (
+    Path(__file__).parents[3]
+    / "tests"
+    / "e2e"
+    / "singlecard"
+    / "spec_decode"
+    / "run_gemma4_mtp_async_benchmark.sh"
+)
 
 
 def _method_source(method_name: str) -> str:
@@ -45,6 +53,38 @@ def test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers():
     assert "if close_early and delta_content:" in source
 
 
+def test_gemma4_mtp_e2e_validates_cancelled_request_resource_release():
+    source = E2E_SOURCE.read_text(encoding="utf-8")
+
+    assert 'server.url_for("v1/responses")' in source
+    assert '"background": True' in source
+    assert 'f"v1/responses/{response_id}/cancel"' in source
+    assert "vllm:num_requests_running" in source
+    assert "vllm:num_requests_waiting" in source
+    assert "_poll_until" in source
+
+
+def test_gemma4_mtp_benchmark_keeps_k_and_workload_constant():
+    source = BENCHMARK_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'MODES=("sync" "async")' in source
+    assert '"--no-async-scheduling"' in source
+    assert '"--async-scheduling"' in source
+    assert "SPECULATIVE_CONFIG" in source
+    assert '"k=${NUM_SPECULATIVE_TOKENS}"' in source
+    for argument, value in (
+        ("--seed", "${BENCHMARK_SEED}"),
+        ("--num-prompts", "${NUM_PROMPTS}"),
+        ("--random-input-len", "${INPUT_LEN}"),
+        ("--random-output-len", "${OUTPUT_LEN}"),
+        ("--max-concurrency", "${MAX_CONCURRENCY}"),
+    ):
+        assert argument in source
+        assert value in source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_keeps_requested_async_scheduling_on_ascend()
     test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers()
+    test_gemma4_mtp_e2e_validates_cancelled_request_resource_release()
+    test_gemma4_mtp_benchmark_keeps_k_and_workload_constant()
