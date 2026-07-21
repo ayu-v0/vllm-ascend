@@ -37,6 +37,7 @@ class AscendGemma4Proposer(Gemma4Proposer, AscendSpecDecodeBaseProposer):
         self._runnable = self._run_merged_draft
         self.constant_draft_positions = True
         self._per_group_block_tables: dict[int, torch.Tensor] = {}
+        self._per_group_slot_mappings: dict[int, torch.Tensor] = {}
         self._centroids_sizes: list[int] = []
         self._centroids_graphs: dict[int, object] = {}
         self._centroids_inputs: dict[int, torch.Tensor] = {}

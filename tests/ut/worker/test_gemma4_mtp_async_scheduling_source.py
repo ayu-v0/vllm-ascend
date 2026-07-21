@@ -25,6 +25,12 @@ MODEL_RUNNER_SOURCE = (
     / "worker"
     / "model_runner_v1.py"
 )
+ASCEND_GEMMA4_PROPOSER_SOURCE = (
+    Path(__file__).parents[3]
+    / "vllm_ascend"
+    / "spec_decode"
+    / "gemma4_proposer.py"
+)
 
 
 def _method_source(method_name: str) -> str:
@@ -91,8 +97,10 @@ def test_gemma4_mtp_benchmark_keeps_k_and_workload_constant():
 
 def test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table():
     runner_source = MODEL_RUNNER_SOURCE.read_text(encoding="utf-8")
+    proposer_source = ASCEND_GEMMA4_PROPOSER_SOURCE.read_text(encoding="utf-8")
 
     assert "self.drafter.set_per_group_attention_metadata(" in runner_source
+    assert "self._per_group_slot_mappings: dict[int, torch.Tensor] = {}" in proposer_source
     assert "cm.block_table_tensor" in runner_source
     assert "cm.slot_mapping" in runner_source
 
