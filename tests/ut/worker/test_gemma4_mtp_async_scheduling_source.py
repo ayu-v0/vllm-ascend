@@ -19,6 +19,12 @@ BENCHMARK_SCRIPT = (
     / "spec_decode"
     / "run_gemma4_mtp_async_benchmark.sh"
 )
+MODEL_RUNNER_SOURCE = (
+    Path(__file__).parents[3]
+    / "vllm_ascend"
+    / "worker"
+    / "model_runner_v1.py"
+)
 
 
 def _method_source(method_name: str) -> str:
@@ -83,8 +89,17 @@ def test_gemma4_mtp_benchmark_keeps_k_and_workload_constant():
         assert value in source
 
 
+def test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table():
+    runner_source = MODEL_RUNNER_SOURCE.read_text(encoding="utf-8")
+
+    assert "self.drafter.set_per_group_attention_metadata(" in runner_source
+    assert "cm.block_table_tensor" in runner_source
+    assert "cm.slot_mapping" in runner_source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_keeps_requested_async_scheduling_on_ascend()
     test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers()
     test_gemma4_mtp_e2e_validates_cancelled_request_resource_release()
     test_gemma4_mtp_benchmark_keeps_k_and_workload_constant()
+    test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table()
