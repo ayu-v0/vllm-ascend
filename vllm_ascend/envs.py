@@ -117,6 +117,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable verbose Gemma4 MTP diagnostics. This is off by default because
     # the diagnostic path logs every decode step and may force CPU/NPU sync.
     "VLLM_ASCEND_GEMMA4_MTP_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_GEMMA4_MTP_DEBUG", "0"))),
+    # Enable sampled Gemma4 MTP async scheduling timing. Unlike the verbose
+    # debug path, this only measures existing host-side boundaries.
+    "VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE", "0"))
+    ),
+    # Record the first eight profiled steps and then one step at this interval.
+    "VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE_EVERY": lambda: int(
+        os.getenv("VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE_EVERY", "64")
+    ),
 }
 
 # end-env-vars-definition

@@ -31,6 +31,7 @@ ASCEND_GEMMA4_PROPOSER_SOURCE = (
     / "spec_decode"
     / "gemma4_proposer.py"
 )
+ASCEND_ENVS_SOURCE = Path(__file__).parents[3] / "vllm_ascend" / "envs.py"
 
 
 def _method_source(method_name: str) -> str:
@@ -106,9 +107,21 @@ def test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table():
     assert "cm.slot_mapping" in runner_source
 
 
+def test_gemma4_mtp_async_profile_is_sampled_and_passed_to_async_output():
+    runner_source = MODEL_RUNNER_SOURCE.read_text(encoding="utf-8")
+    envs_source = ASCEND_ENVS_SOURCE.read_text(encoding="utf-8")
+
+    assert "VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE" in envs_source
+    assert "VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE_EVERY" in envs_source
+    assert "Gemma4 MTP async profile: worker" in runner_source
+    assert "profile_context=profile_context" in runner_source
+    assert "profile_iteration <= 8 or profile_iteration % profile_every == 0" in runner_source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_keeps_requested_async_scheduling_on_ascend()
     test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers()
     test_gemma4_mtp_e2e_validates_cancelled_request_resource_release()
     test_gemma4_mtp_benchmark_keeps_k_and_workload_constant()
     test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table()
+    test_gemma4_mtp_async_profile_is_sampled_and_passed_to_async_output()

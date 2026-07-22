@@ -312,6 +312,12 @@ def _gemma4_mtp_debug_enabled(drafter: Any) -> bool:
     return _GEMMA4_MTP_DEBUG and isinstance(drafter, AscendGemma4Proposer)
 
 
+def _gemma4_mtp_async_profile_enabled(drafter: Any) -> bool:
+    return envs_ascend.VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE and isinstance(
+        drafter, AscendGemma4Proposer
+    )
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -1960,6 +1966,15 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        profile_context: dict[str, float | int] | None = None
+        if _gemma4_mtp_async_profile_enabled(self.drafter):
+            profile_iteration = getattr(self, "_gemma4_mtp_async_profile_iteration", 0) + 1
+            self._gemma4_mtp_async_profile_iteration = profile_iteration
+            profile_every = max(1, envs_ascend.VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE_EVERY)
+            if profile_iteration <= 8 or profile_iteration % profile_every == 0:
+                profile_context = {"iteration": profile_iteration, "execute_start": time.perf_counter()}
+        self._gemma4_mtp_async_profile_context = profile_context
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -1997,6 +2012,7 @@ class NPUModelRunner(GPUModelRunner):
         )):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        prepare_input_start = time.perf_counter() if profile_context is not None else 0.0
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
@@ -2259,6 +2275,9 @@ class NPUModelRunner(GPUModelRunner):
                     _debug_attn_metadata_preview(attn_metadata),
                 )
 
+        if profile_context is not None:
+            profile_context["prepare_input_ms"] = (time.perf_counter() - prepare_input_start) * 1000.0
+
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
@@ -2283,6 +2302,7 @@ class NPUModelRunner(GPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
+        forward_start = time.perf_counter() if profile_context is not None else 0.0
         clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
@@ -2310,6 +2330,9 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        if profile_context is not None:
+            profile_context["forward_launch_ms"] = (time.perf_counter() - forward_start) * 1000.0
+        postprocess_start = time.perf_counter() if profile_context is not None else 0.0
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2427,10 +2450,17 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.kv_connector_output = kv_connector_output
 
+        if profile_context is not None:
+            profile_context["postprocess_ms"] = (time.perf_counter() - postprocess_start) * 1000.0
+
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
+        if profile_context is not None:
+            profile_context["execute_model_total_ms"] = (
+                time.perf_counter() - profile_context["execute_start"]
+            ) * 1000.0
         return None
 
     @torch.inference_mode()
@@ -2475,6 +2505,8 @@ class NPUModelRunner(GPUModelRunner):
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+        profile_context = getattr(self, "_gemma4_mtp_async_profile_context", None)
+        self._gemma4_mtp_async_profile_context = None
         use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.drafter)
 
         # Apply structured output bitmasks if present.
@@ -2486,8 +2518,11 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
+        sampling_start = time.perf_counter() if profile_context is not None else 0.0
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if profile_context is not None:
+            profile_context["sampling_ms"] = (time.perf_counter() - sampling_start) * 1000.0
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -2528,6 +2563,7 @@ class NPUModelRunner(GPUModelRunner):
                     _debug_shape(self._draft_token_ids),
                 )
 
+        bookkeeping_start = time.perf_counter() if profile_context is not None else 0.0
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -2543,6 +2579,8 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        if profile_context is not None:
+            profile_context["bookkeeping_ms"] = (time.perf_counter() - bookkeeping_start) * 1000.0
         if use_gemma4_mtp_debug:
             logger.warning(
                 "Gemma4 MTP debug: bookkeeping_sync done "
@@ -2554,6 +2592,7 @@ class NPUModelRunner(GPUModelRunner):
                 prompt_logprobs_dict is not None,
             )
 
+        draft_start = time.perf_counter() if profile_context is not None else 0.0
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
@@ -2641,6 +2680,8 @@ class NPUModelRunner(GPUModelRunner):
                 self.finalize_kv_connector()
                 if use_gemma4_mtp_debug:
                     logger.warning("Gemma4 MTP debug: finalize_kv_connector done")
+        if profile_context is not None:
+            profile_context["draft_ms"] = (time.perf_counter() - draft_start) * 1000.0
 
         routed_experts_lists = None
         if self.model_config.enable_return_routed_experts:
@@ -2704,6 +2745,24 @@ class NPUModelRunner(GPUModelRunner):
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
         if not self.use_async_scheduling:
+            if profile_context is not None:
+                profile_context["sample_tokens_total_ms"] = (
+                    time.perf_counter() - sampling_start
+                ) * 1000.0
+                logger.info(
+                    "Gemma4 MTP async profile: worker iteration=%s mode=sync "
+                    "prepare_input_ms=%.3f forward_launch_ms=%.3f "
+                    "postprocess_ms=%.3f sampling_ms=%.3f "
+                    "bookkeeping_ms=%.3f draft_ms=%.3f sample_tokens_total_ms=%.3f",
+                    profile_context["iteration"],
+                    profile_context.get("prepare_input_ms", 0.0),
+                    profile_context.get("forward_launch_ms", 0.0),
+                    profile_context.get("postprocess_ms", 0.0),
+                    profile_context.get("sampling_ms", 0.0),
+                    profile_context.get("bookkeeping_ms", 0.0),
+                    profile_context.get("draft_ms", 0.0),
+                    profile_context["sample_tokens_total_ms"],
+                )
             if use_gemma4_mtp_debug:
                 logger.warning("Gemma4 MTP debug: sync output return")
             return model_runner_output
@@ -2721,6 +2780,7 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(self.drafter, AscendGemma4Proposer)
             else None
         )
+        async_output_launch_start = time.perf_counter() if profile_context is not None else 0.0
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -2729,7 +2789,15 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
             valid_sampled_token_count=valid_sampled_token_count,
+            profile_context=profile_context,
         )
+        if profile_context is not None:
+            profile_context["async_output_launch_ms"] = (
+                time.perf_counter() - async_output_launch_start
+            ) * 1000.0
+            profile_context["sample_tokens_total_ms"] = (
+                time.perf_counter() - sampling_start
+            ) * 1000.0
         if use_gemma4_mtp_debug:
             logger.warning(
                 "Gemma4 MTP debug: async output construct done "
