@@ -76,17 +76,18 @@ def gemma4_mtp_server(
 ) -> Iterator[RemoteOpenAIServer]:
     assert MODEL is not None
     port = get_open_port()
+    env_dict = {}
+    if async_scheduling:
+        env_dict["VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX"] = "1"
+    if enable_responses_store:
+        env_dict["VLLM_ENABLE_RESPONSES_API_STORE"] = "1"
     with RemoteOpenAIServer(
         MODEL,
         _server_args(port, async_scheduling=async_scheduling),
         server_host="127.0.0.1",
         server_port=port,
         auto_port=False,
-        env_dict=(
-            {"VLLM_ENABLE_RESPONSES_API_STORE": "1"}
-            if enable_responses_store
-            else None
-        ),
+        env_dict=env_dict or None,
     ) as server:
         yield server
 

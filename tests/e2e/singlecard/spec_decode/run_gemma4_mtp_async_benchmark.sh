@@ -14,6 +14,10 @@ if [[ -n "${VLLM_ASCEND_GEMMA4_MTP_DEBUG:-}" ]]; then
   echo "Unset VLLM_ASCEND_GEMMA4_MTP_DEBUG before benchmarking." >&2
   exit 2
 fi
+if [[ "${VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE:-0}" != "0" ]]; then
+  echo "Unset VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE before benchmarking." >&2
+  exit 2
+fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MODEL=${VLLM_ASCEND_GEMMA4_MTP_MODEL}
@@ -25,6 +29,7 @@ MAX_NUM_SEQS=${VLLM_ASCEND_GEMMA4_MTP_BENCH_MAX_NUM_SEQS:-72}
 MAX_BATCHED_TOKENS=${VLLM_ASCEND_GEMMA4_MTP_BENCH_MAX_BATCHED_TOKENS:-16384}
 GPU_MEMORY_UTILIZATION=${VLLM_ASCEND_GEMMA4_MTP_BENCH_GPU_MEMORY_UTILIZATION:-0.9}
 BENCHMARK_PORT=${VLLM_ASCEND_GEMMA4_MTP_BENCH_PORT:-8100}
+SERVER_LOG_LEVEL=${VLLM_ASCEND_GEMMA4_MTP_BENCH_LOG_LEVEL:-WARNING}
 NUM_PROMPTS=${VLLM_ASCEND_GEMMA4_MTP_BENCH_NUM_PROMPTS:-3000}
 INPUT_LEN=${VLLM_ASCEND_GEMMA4_MTP_BENCH_INPUT_LEN:-256}
 OUTPUT_LEN=${VLLM_ASCEND_GEMMA4_MTP_BENCH_OUTPUT_LEN:-128}
@@ -64,7 +69,7 @@ wait_for_health() {
   local url=$1
   local log_file=$2
   for _ in $(seq 1 1800); do
-    if curl --fail --silent --show-error "${url}/health" >/dev/null; then
+    if curl --fail --silent "${url}/health" >/dev/null; then
       return
     fi
     if [[ -n "${SERVER_PID}" ]] && ! kill -0 "${SERVER_PID}" 2>/dev/null; then
@@ -86,12 +91,22 @@ run_mode() {
   local result_file="${mode}.json"
   local scheduling_arg
   local -a server_args
+  local -a server_env
 
   mkdir -p "${mode_dir}"
   if [[ "${mode}" == "sync" ]]; then
     scheduling_arg="--no-async-scheduling"
   else
     scheduling_arg="--async-scheduling"
+  fi
+
+  server_env=(
+    env
+    "VLLM_LOGGING_LEVEL=${SERVER_LOG_LEVEL}"
+    "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX=0"
+  )
+  if [[ "${mode}" == "async" ]]; then
+    server_env[2]="VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX=1"
   fi
 
   server_args=(
@@ -118,7 +133,7 @@ run_mode() {
 
   printf '%q ' "${server_args[@]}" >"${mode_dir}/server-command.txt"
   printf '\n' >>"${mode_dir}/server-command.txt"
-  "${server_args[@]}" >"${log_file}" 2>&1 &
+  "${server_env[@]}" "${server_args[@]}" >"${log_file}" 2>&1 &
   SERVER_PID=$!
   wait_for_health "http://127.0.0.1:${BENCHMARK_PORT}" "${log_file}"
 
@@ -137,6 +152,7 @@ run_mode() {
     --max-concurrency "${MAX_CONCURRENCY}" \
     --seed "${BENCHMARK_SEED}" \
     --disable-shuffle \
+    --disable-tqdm \
     --ignore-eos \
     --temperature 0 \
     --percentile-metrics ttft,e2el \

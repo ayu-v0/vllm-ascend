@@ -34,6 +34,26 @@ ASCEND_GEMMA4_PROPOSER_SOURCE = (
 ASCEND_ENVS_SOURCE = Path(__file__).parents[3] / "vllm_ascend" / "envs.py"
 
 
+def _find_vllm_engine_core_source() -> Path:
+    ascend_root = Path(__file__).parents[3]
+    suffix = Path("vllm") / "v1" / "engine" / "core.py"
+    direct_candidate = ascend_root.parent / "vllm" / suffix
+    if direct_candidate.is_file():
+        return direct_candidate
+
+    versioned_ascend_parent = ascend_root.parent
+    versioned_vllm_parent = versioned_ascend_parent.parent / versioned_ascend_parent.name.replace(
+        "vllm-ascend-", "vllm-", 1
+    )
+    versioned_candidate = versioned_vllm_parent / "vllm" / suffix
+    if versioned_candidate.is_file():
+        return versioned_candidate
+    raise AssertionError("Unable to locate the sibling vLLM EngineCore source")
+
+
+VLLM_ENGINE_CORE_SOURCE = _find_vllm_engine_core_source()
+
+
 def _method_source(method_name: str) -> str:
     text = SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(text)
@@ -105,6 +125,17 @@ def test_gemma4_mtp_benchmark_defaults_support_the_target_load():
     assert 'MAX_CONCURRENCY=${VLLM_ASCEND_GEMMA4_MTP_BENCH_MAX_CONCURRENCY:-72}' in source
 
 
+def test_gemma4_mtp_benchmark_uses_low_noise_logging_without_disabling_metrics():
+    source = BENCHMARK_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'SERVER_LOG_LEVEL=${VLLM_ASCEND_GEMMA4_MTP_BENCH_LOG_LEVEL:-WARNING}' in source
+    assert 'VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE' in source
+    assert '"${server_env[@]}" "${server_args[@]}"' in source
+    assert '--disable-tqdm' in source
+    assert '--disable-log-stats' not in source
+    assert '--enable-log-requests' not in source
+
+
 def test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table():
     runner_source = MODEL_RUNNER_SOURCE.read_text(encoding="utf-8")
     proposer_source = ASCEND_GEMMA4_PROPOSER_SOURCE.read_text(encoding="utf-8")
@@ -126,11 +157,37 @@ def test_gemma4_mtp_async_profile_is_sampled_and_passed_to_async_output():
     assert "profile_iteration <= 8 or profile_iteration % profile_every == 0" in runner_source
 
 
+def test_gemma4_mtp_completed_head_ttft_fix_is_scoped_and_nonblocking():
+    core_source = VLLM_ENGINE_CORE_SOURCE.read_text(encoding="utf-8")
+    envs_source = ASCEND_ENVS_SOURCE.read_text(encoding="utf-8")
+
+    assert "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX" in envs_source
+    assert "_should_deliver_completed_gemma4_mtp_batch_head" in core_source
+    assert "_consume_batch_queue_output" in core_source
+    assert "future.done()" in core_source
+    assert 'device_type == "npu"' in core_source
+    assert 'method == "mtp"' in core_source
+    assert 'model_type == "gemma4"' in core_source
+
+
+def test_gemma4_mtp_completed_head_ttft_fix_is_enabled_only_for_async_validation():
+    e2e_source = E2E_SOURCE.read_text(encoding="utf-8")
+    benchmark_source = BENCHMARK_SCRIPT.read_text(encoding="utf-8")
+
+    assert "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX" in e2e_source
+    assert "if async_scheduling" in e2e_source
+    assert '"VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX=1"' in benchmark_source
+    assert '"VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX=0"' in benchmark_source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_keeps_requested_async_scheduling_on_ascend()
     test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers()
     test_gemma4_mtp_e2e_validates_cancelled_request_resource_release()
     test_gemma4_mtp_benchmark_keeps_k_and_workload_constant()
     test_gemma4_mtp_benchmark_defaults_support_the_target_load()
+    test_gemma4_mtp_benchmark_uses_low_noise_logging_without_disabling_metrics()
     test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table()
     test_gemma4_mtp_async_profile_is_sampled_and_passed_to_async_output()
+    test_gemma4_mtp_completed_head_ttft_fix_is_scoped_and_nonblocking()
+    test_gemma4_mtp_completed_head_ttft_fix_is_enabled_only_for_async_validation()
