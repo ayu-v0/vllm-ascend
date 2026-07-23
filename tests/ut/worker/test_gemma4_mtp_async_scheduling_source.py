@@ -97,6 +97,14 @@ def test_gemma4_mtp_benchmark_keeps_k_and_workload_constant():
         assert value in source
 
 
+def test_gemma4_mtp_benchmark_defaults_support_the_target_load():
+    source = BENCHMARK_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'MAX_NUM_SEQS=${VLLM_ASCEND_GEMMA4_MTP_BENCH_MAX_NUM_SEQS:-72}' in source
+    assert 'NUM_PROMPTS=${VLLM_ASCEND_GEMMA4_MTP_BENCH_NUM_PROMPTS:-3000}' in source
+    assert 'MAX_CONCURRENCY=${VLLM_ASCEND_GEMMA4_MTP_BENCH_MAX_CONCURRENCY:-72}' in source
+
+
 def test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table():
     runner_source = MODEL_RUNNER_SOURCE.read_text(encoding="utf-8")
     proposer_source = ASCEND_GEMMA4_PROPOSER_SOURCE.read_text(encoding="utf-8")
@@ -123,5 +131,6 @@ if __name__ == "__main__":
     test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers()
     test_gemma4_mtp_e2e_validates_cancelled_request_resource_release()
     test_gemma4_mtp_benchmark_keeps_k_and_workload_constant()
+    test_gemma4_mtp_benchmark_defaults_support_the_target_load()
     test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table()
     test_gemma4_mtp_async_profile_is_sampled_and_passed_to_async_output()
