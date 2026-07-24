@@ -72,7 +72,7 @@ def test_gemma4_mtp_diagnostic_stage_logs_are_present():
         "Gemma4 MTP debug: parsed sampled tokens",
         "Gemma4 MTP debug: finalize_kv_connector start",
         "Gemma4 MTP debug: async output construct start",
-        "Gemma4 MTP debug: async output return",
+        "Gemma4 MTP debug: async output construct done",
     ]:
         assert marker in base_source or marker in runner_source
 
@@ -139,6 +139,15 @@ def test_gemma4_mtp_reinitializes_metadata_shape_for_every_draft_step():
     assert "if draft_step == 1 or keep_positions_and_seq_lens:" in source
 
 
+def test_gemma4_mtp_merged_draft_keeps_model_positions_constant():
+    source = _method_source_from(BASE_SOURCE, "_run_merged_draft")
+
+    assert "if not self.constant_draft_positions:" in source
+    constant_position_guard = source.index("if not self.constant_draft_positions:")
+    position_increment = source.index("positions += 1")
+    assert constant_position_guard < position_increment
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
     test_ascend_gemma4_uses_sparse_top_tokens_without_cuda_graphs()
@@ -151,3 +160,4 @@ if __name__ == "__main__":
     test_gemma4_mtp_uses_constant_position_multistep_metadata_helper()
     test_gemma4_mtp_constant_metadata_does_not_mutate_position_input()
     test_gemma4_mtp_reinitializes_metadata_shape_for_every_draft_step()
+    test_gemma4_mtp_merged_draft_keeps_model_positions_constant()
