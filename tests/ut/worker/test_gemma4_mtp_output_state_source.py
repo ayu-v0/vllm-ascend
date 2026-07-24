@@ -97,6 +97,28 @@ def test_gemma4_mtp_passes_current_count_to_async_output_only():
     assert "self.valid_sampled_token_count_gpu" in source
 
 
+def test_gemma4_mtp_collects_async_state_snapshots_without_early_host_reads():
+    text = SOURCE.read_text(encoding="utf-8")
+
+    assert "_gemma4_mtp_async_debug_tensors" in text
+    assert '"prev_positions"' in text
+    assert '"prev_num_draft_tokens"' in text
+    assert '"num_computed_before"' in text
+    assert '"num_computed_after"' in text
+    assert '"num_accepted_tokens"' in text
+    assert '"draft_token_ids"' in text
+    assert 'f"group_{kv_cache_gid}_block_table"' in text
+    assert 'f"group_{kv_cache_gid}_slot_mapping"' in text
+    assert "debug_tensors=debug_tensors" in text
+    assert "debug_context=debug_context" in text
+
+    prepare_source = _method_source("_prepare_inputs")
+    snapshot_start = prepare_source.index("debug_async_state =")
+    snapshot_source = prepare_source[snapshot_start:]
+    assert ".tolist()" not in snapshot_source
+    assert ".cpu()" not in snapshot_source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_enables_accepted_token_state_updates()
     test_gemma4_mtp_keeps_async_output_async_by_default()
@@ -106,3 +128,4 @@ if __name__ == "__main__":
     test_gemma4_mtp_logs_paged_kv_gather_bounds()
     test_gemma4_mtp_gather_owns_block_id_tensor()
     test_gemma4_mtp_passes_current_count_to_async_output_only()
+    test_gemma4_mtp_collects_async_state_snapshots_without_early_host_reads()

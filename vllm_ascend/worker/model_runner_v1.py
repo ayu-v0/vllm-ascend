@@ -451,6 +451,8 @@ class NPUModelRunner(GPUModelRunner):
         # use_hybrid_blocks: if hybrid blocks is used.
         self.use_hybrid_blocks: bool = False
         self.need_accepted_tokens: bool = False
+        self._gemma4_mtp_async_debug_tensors: dict[str, torch.Tensor] = {}
+        self._gemma4_mtp_async_debug_context: dict[str, object] | None = None
 
         self.is_multimodal_model = self.model_config.is_multimodal_model
         self.block_size = vllm_config.cache_config.block_size
@@ -1085,6 +1087,14 @@ class NPUModelRunner(GPUModelRunner):
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
 
+        debug_async_state = (
+            _gemma4_mtp_debug_enabled(self.drafter)
+            and self.use_async_spec_decode
+        )
+        num_computed_before = (
+            self.num_computed_tokens.clone() if debug_async_state else None
+        )
+
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
@@ -1112,6 +1122,23 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
+
+        if debug_async_state:
+            assert num_computed_before is not None
+            self._gemma4_mtp_async_debug_tensors = {
+                "prev_positions": self.prev_positions.gpu[:num_reqs].clone(),
+                "prev_num_draft_tokens": self.prev_num_draft_tokens.gpu.clone(),
+                "num_computed_before": num_computed_before,
+                "num_computed_after": self.num_computed_tokens[:num_reqs].clone(),
+                "num_accepted_tokens": self.num_accepted_tokens.gpu[:num_reqs].clone(),
+            }
+            self._gemma4_mtp_async_debug_context = {
+                "req_ids": self.input_batch.req_ids[:num_reqs].copy(),
+                "prev_req_id_to_index": dict(prev_req_id_to_index or {}),
+            }
+        else:
+            self._gemma4_mtp_async_debug_tensors = {}
+            self._gemma4_mtp_async_debug_context = None
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -2780,6 +2807,16 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(self.drafter, AscendGemma4Proposer)
             else None
         )
+        debug_tensors = None
+        debug_context = None
+        if use_gemma4_mtp_debug:
+            debug_tensors = dict(self._gemma4_mtp_async_debug_tensors)
+            if torch.is_tensor(self._draft_token_ids):
+                debug_tensors["draft_token_ids"] = self._draft_token_ids.clone()
+            debug_context = dict(self._gemma4_mtp_async_debug_context or {})
+            debug_context["trace_id"] = getattr(
+                self, "_gemma4_mtp_async_trace_id", None
+            )
         async_output_launch_start = time.perf_counter() if profile_context is not None else 0.0
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
@@ -2790,7 +2827,10 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.input_batch.vocab_size,
             valid_sampled_token_count=valid_sampled_token_count,
             profile_context=profile_context,
+            debug_tensors=debug_tensors,
+            debug_context=debug_context,
         )
+        async_output._gemma4_mtp_debug = use_gemma4_mtp_debug
         if profile_context is not None:
             profile_context["async_output_launch_ms"] = (
                 time.perf_counter() - async_output_launch_start
@@ -3560,6 +3600,16 @@ class NPUModelRunner(GPUModelRunner):
                     cm.block_table_tensor,
                     cm.slot_mapping,
                 )
+                if _gemma4_mtp_debug_enabled(self.drafter):
+                    debug_tensors = self._gemma4_mtp_async_debug_tensors
+                    if cm.block_table_tensor is not None:
+                        debug_tensors[f"group_{kv_cache_gid}_block_table"] = (
+                            cm.block_table_tensor[:num_reqs, :4].clone()
+                        )
+                    if cm.slot_mapping is not None:
+                        debug_tensors[f"group_{kv_cache_gid}_slot_mapping"] = (
+                            cm.slot_mapping.reshape(-1)[:16].clone()
+                        )
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)

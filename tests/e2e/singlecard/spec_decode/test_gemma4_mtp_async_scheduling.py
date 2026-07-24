@@ -40,14 +40,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _server_args(port: int, *, async_scheduling: bool) -> list[str]:
-    speculative_config = json.dumps(
-        {
-            "method": "mtp",
-            "model": DRAFT_MODEL,
-            "num_speculative_tokens": NUM_SPECULATIVE_TOKENS,
-        }
-    )
+def _server_args(
+    port: int,
+    *,
+    async_scheduling: bool,
+    use_mtp: bool,
+    num_speculative_tokens: int,
+    executor_backend: str = "uni",
+) -> list[str]:
     args = [
         "--host",
         "0.0.0.0",
@@ -60,9 +60,22 @@ def _server_args(port: int, *, async_scheduling: bool) -> list[str]:
         "--trust-remote-code",
         "--language-model-only",
         "--enable-chunked-prefill",
-        "--speculative-config",
-        speculative_config,
+        "--distributed-executor-backend",
+        executor_backend,
     ]
+    if use_mtp:
+        args.extend(
+            [
+                "--speculative-config",
+                json.dumps(
+                    {
+                        "method": "mtp",
+                        "model": DRAFT_MODEL,
+                        "num_speculative_tokens": num_speculative_tokens,
+                    }
+                ),
+            ]
+        )
     if async_scheduling:
         args.append("--async-scheduling")
     else:
@@ -71,23 +84,41 @@ def _server_args(port: int, *, async_scheduling: bool) -> list[str]:
 
 
 @contextmanager
-def gemma4_mtp_server(
-    *, async_scheduling: bool, enable_responses_store: bool = False
+def gemma4_server(
+    *,
+    async_scheduling: bool,
+    use_mtp: bool,
+    num_speculative_tokens: int = NUM_SPECULATIVE_TOKENS,
+    executor_backend: str = "uni",
+    completed_head: bool = False,
+    async_uniproc_submit: bool = False,
+    enable_responses_store: bool = False,
 ) -> Iterator[RemoteOpenAIServer]:
     assert MODEL is not None
     port = get_open_port()
-    env_dict = {}
-    if async_scheduling:
-        env_dict["VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX"] = "1"
+    env_dict = {
+        "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX": (
+            "1" if completed_head else "0"
+        ),
+        "VLLM_ASCEND_GEMMA4_MTP_ASYNC_UNIPROC_SUBMIT": (
+            "1" if async_uniproc_submit else "0"
+        ),
+    }
     if enable_responses_store:
         env_dict["VLLM_ENABLE_RESPONSES_API_STORE"] = "1"
     with RemoteOpenAIServer(
         MODEL,
-        _server_args(port, async_scheduling=async_scheduling),
+        _server_args(
+            port,
+            async_scheduling=async_scheduling,
+            use_mtp=use_mtp,
+            num_speculative_tokens=num_speculative_tokens,
+            executor_backend=executor_backend,
+        ),
         server_host="127.0.0.1",
         server_port=port,
         auto_port=False,
-        env_dict=env_dict or None,
+        env_dict=env_dict,
     ) as server:
         yield server
 
@@ -216,16 +247,82 @@ def _choice_view(completion: dict) -> tuple[list[int], str, str | None]:
     return choice["token_ids"], choice["message"]["content"], choice["finish_reason"]
 
 
+def _assert_choice_equivalent(
+    expected: dict,
+    actual: dict,
+    *,
+    expected_name: str,
+    actual_name: str,
+) -> None:
+    expected_ids, expected_text, expected_finish = _choice_view(expected)
+    actual_ids, actual_text, actual_finish = _choice_view(actual)
+    common = min(len(expected_ids), len(actual_ids))
+    mismatch = next(
+        (i for i in range(common) if expected_ids[i] != actual_ids[i]),
+        common if len(expected_ids) != len(actual_ids) else None,
+    )
+    if mismatch is not None:
+        start = max(0, mismatch - 8)
+        end = mismatch + 9
+        raise AssertionError(
+            f"{expected_name} != {actual_name}; first mismatch={mismatch}; "
+            f"matching_prefix={expected_ids[:mismatch]}; "
+            f"{expected_name}[{start}:{end}]={expected_ids[start:end]}; "
+            f"{actual_name}[{start}:{end}]={actual_ids[start:end]}; "
+            f"lengths=({len(expected_ids)}, {len(actual_ids)})"
+        )
+    assert actual_text == expected_text, f"{expected_name} text != {actual_name} text"
+    assert actual_finish == expected_finish, (
+        f"{expected_name} finish_reason != {actual_name} finish_reason"
+    )
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 3])
+def test_greedy_target_sync_async_equivalence(num_speculative_tokens: int):
+    prompt = "请用三句话解释为什么幂等接口可以安全重试。"
+    with gemma4_server(
+        async_scheduling=False,
+        use_mtp=False,
+        num_speculative_tokens=num_speculative_tokens,
+    ) as target_server:
+        target = _completion(target_server, prompt)
+    with gemma4_server(
+        async_scheduling=False,
+        use_mtp=True,
+        num_speculative_tokens=num_speculative_tokens,
+    ) as sync_server:
+        sync = _completion(sync_server, prompt)
+    with gemma4_server(
+        async_scheduling=True,
+        use_mtp=True,
+        num_speculative_tokens=num_speculative_tokens,
+    ) as async_server:
+        async_result = _completion(async_server, prompt)
+
+    _assert_choice_equivalent(
+        target,
+        sync,
+        expected_name="target-only",
+        actual_name=f"sync-mtp-k{num_speculative_tokens}",
+    )
+    _assert_choice_equivalent(
+        target,
+        async_result,
+        expected_name="target-only",
+        actual_name=f"async-mtp-k{num_speculative_tokens}",
+    )
+
+
 def test_greedy_token_ids_match_sync_and_async_without_padding():
     prompt = "请用三句话解释为什么幂等接口可以安全重试。"
     eos_prompt = "Reply with exactly this word: OK"
     stop_prompt = "Reply with exactly: alpha [MTP-END] beta"
-    with gemma4_mtp_server(async_scheduling=False) as sync_server:
+    with gemma4_server(async_scheduling=False, use_mtp=True) as sync_server:
         sync = _completion(sync_server, prompt)
         sync_max_tokens = _completion(sync_server, prompt, max_tokens=1)
         sync_eos = _completion(sync_server, eos_prompt, max_tokens=32)
         sync_stop = _completion(sync_server, stop_prompt, max_tokens=32, stop=["[MTP-END]"])
-    with gemma4_mtp_server(async_scheduling=True) as async_server:
+    with gemma4_server(async_scheduling=True, use_mtp=True) as async_server:
         async_result = _completion(async_server, prompt)
         async_max_tokens = _completion(async_server, prompt, max_tokens=1)
         async_eos = _completion(async_server, eos_prompt, max_tokens=32)
@@ -243,7 +340,11 @@ def test_greedy_token_ids_match_sync_and_async_without_padding():
 
 def test_streaming_matches_non_streaming_and_cancel_releases_resources():
     prompt = "写一段关于分布式系统幂等性的简短说明。"
-    with gemma4_mtp_server(async_scheduling=True, enable_responses_store=True) as server:
+    with gemma4_server(
+        async_scheduling=True,
+        use_mtp=True,
+        enable_responses_store=True,
+    ) as server:
         non_streaming = _completion(server, prompt)
         streamed_text, finish_reason = _stream_completion(server, prompt)
         assert streamed_text == _choice_view(non_streaming)[1]
@@ -293,7 +394,7 @@ def test_mixed_prefill_decode_requests_complete_without_padding_or_reordering():
         ("Respond with exactly this marker: MTP-SHORT-C", "MTP-SHORT-C"),
     ]
 
-    with gemma4_mtp_server(async_scheduling=True) as server:
+    with gemma4_server(async_scheduling=True, use_mtp=True) as server:
         with ThreadPoolExecutor(max_workers=len(requests_to_run)) as executor:
             futures = [
                 executor.submit(_completion, server, prompt)
