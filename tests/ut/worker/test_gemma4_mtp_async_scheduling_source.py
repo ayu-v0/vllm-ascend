@@ -119,6 +119,14 @@ def test_gemma4_mtp_keeps_requested_async_scheduling_on_ascend():
     assert "VLLM_ASCEND_ENABLE_GEMMA4_MTP_ASYNC" not in source
 
 
+def test_gemma4_mtp_oracle_has_a_dedicated_default_off_switch():
+    source = ASCEND_ENVS_SOURCE.read_text(encoding="utf-8")
+
+    assert '"VLLM_ASCEND_GEMMA4_MTP_ORACLE"' in source
+    assert 'os.getenv("VLLM_ASCEND_GEMMA4_MTP_ORACLE", "0")' in source
+    assert '"VLLM_ASCEND_GEMMA4_MTP_DEBUG"' in source
+
+
 def test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers():
     source = E2E_SOURCE.read_text(encoding="utf-8")
 

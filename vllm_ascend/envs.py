@@ -117,6 +117,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable verbose Gemma4 MTP diagnostics. This is off by default because
     # the diagnostic path logs every decode step and may force CPU/NPU sync.
     "VLLM_ASCEND_GEMMA4_MTP_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_GEMMA4_MTP_DEBUG", "0"))),
+    # Enable the nonblocking Gemma4 MTP correctness oracle. Unlike the verbose
+    # debug path, this only captures small device tensors and validates them
+    # after the existing output-copy readiness boundary.
+    "VLLM_ASCEND_GEMMA4_MTP_ORACLE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_GEMMA4_MTP_ORACLE", "0"))
+    ),
     # Enable the experimental completed-head delivery policy for Gemma4 MTP
     # Ascend async scheduling. This remains disabled by default.
     "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX": lambda: bool(
