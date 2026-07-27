@@ -43,6 +43,15 @@ def _oracle_tensors(
     }
 
 
+def test_select_full_vocab_processed_logits_accepts_greedy_tuple():
+    full_vocab_logits = object()
+    select = MODULE.select_full_vocab_processed_logits
+
+    assert select(full_vocab_logits) is full_vocab_logits
+    assert select((full_vocab_logits, None)) is full_vocab_logits
+    assert select((full_vocab_logits, [3, 7])) is None
+
+
 @pytest.mark.parametrize(
     ("target", "draft", "bonus", "counts", "max_spec_len", "expected"),
     [
@@ -97,6 +106,7 @@ def test_validate_greedy_oracle_accepts_near_tie_when_output_matches_argmax():
         tensors=tensors,
         context={
             "trace_id": 7,
+            "oracle_req_ids": ["req-7"],
             "oracle_num_draft_tokens": [1],
             "oracle_max_spec_len": 1,
             "oracle_vocab_size": 100,
@@ -119,6 +129,7 @@ def test_validate_greedy_oracle_rejects_sampled_token_mismatch():
             tensors=tensors,
             context={
                 "trace_id": 8,
+                "oracle_req_ids": ["req-8"],
                 "oracle_num_draft_tokens": [1],
                 "oracle_max_spec_len": 1,
                 "oracle_vocab_size": 100,
@@ -173,12 +184,82 @@ def test_validate_greedy_oracle_rejects_valid_count_mismatch():
             tensors=tensors,
             context={
                 "trace_id": 9,
+                "oracle_req_ids": ["req-9"],
                 "oracle_num_draft_tokens": [1],
                 "oracle_max_spec_len": 1,
                 "oracle_vocab_size": 100,
             },
             parsed_token_ids=[[10, 20]],
             valid_sampled_token_count=[1],
+        )
+
+
+def test_validate_greedy_oracle_rejects_extra_valid_count_rows():
+    tensors = _oracle_tensors(
+        target=[10],
+        draft=[10],
+        bonus=[20],
+        sampled=[[10, 20]],
+    )
+
+    with pytest.raises(AssertionError, match="valid count rows"):
+        validate_greedy_oracle_snapshot(
+            tensors=tensors,
+            context={
+                "trace_id": 10,
+                "oracle_req_ids": ["req-10"],
+                "oracle_num_draft_tokens": [1],
+                "oracle_max_spec_len": 1,
+                "oracle_vocab_size": 100,
+            },
+            parsed_token_ids=[[10, 20]],
+            valid_sampled_token_count=[2, 99],
+        )
+
+
+def test_validate_greedy_oracle_rejects_request_row_mismatch():
+    tensors = _oracle_tensors(
+        target=[10],
+        draft=[10],
+        bonus=[20],
+        sampled=[[10, 20]],
+    )
+
+    with pytest.raises(AssertionError, match="oracle request rows"):
+        validate_greedy_oracle_snapshot(
+            tensors=tensors,
+            context={
+                "trace_id": 11,
+                "oracle_req_ids": [],
+                "oracle_num_draft_tokens": [1],
+                "oracle_max_spec_len": 1,
+                "oracle_vocab_size": 100,
+            },
+            parsed_token_ids=[[10, 20]],
+            valid_sampled_token_count=[2],
+        )
+
+
+def test_validate_greedy_oracle_rejects_non_vector_valid_count():
+    tensors = _oracle_tensors(
+        target=[10],
+        draft=[10],
+        bonus=[20],
+        sampled=[[10, 20]],
+    )
+
+    with pytest.raises(AssertionError, match="one-dimensional"):
+        validate_greedy_oracle_snapshot(
+            tensors=tensors,
+            context={
+                "trace_id": 12,
+                "oracle_req_ids": ["req-12"],
+                "oracle_num_draft_tokens": [1],
+                "oracle_max_spec_len": 1,
+                "oracle_vocab_size": 100,
+            },
+            parsed_token_ids=[[10, 20]],
+            valid_sampled_token_count=[[2]],
         )
 
 
@@ -191,13 +272,17 @@ def test_validate_async_state_snapshot_handles_reorder_and_new_request():
         "num_computed_before": [100, 200, 300],
         "num_computed_after": [301, 101, 7, 203],
         "num_accepted_tokens": [1, 1, 1, 3],
-        "group_0_block_table": [[1, 2]],
-        "group_0_slot_mapping": [8, 9],
+        "group_0_block_table": [[1, 2], [3, 4], [5, 6], [7, 8]],
+        "group_0_slot_mapping": [8, 9, 10, 11],
     }
     context = {
         "req_ids": ["c", "a", "new", "b"],
         "prev_req_id_to_index": {"a": 0, "b": 1, "c": 2},
         "state_correction_applied": True,
+        "oracle_kv_group_ids": [0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (4, 2), "slot_mapping": (4,)},
+        },
     }
 
     validate_async_state_snapshot(tensors=tensors, context=context)
@@ -212,11 +297,17 @@ def test_validate_async_state_snapshot_uses_cpu_value_without_previous_batch():
         "num_computed_before": [],
         "num_computed_after": [7],
         "num_accepted_tokens": [1],
+        "group_0_block_table": [[1]],
+        "group_0_slot_mapping": [8],
     }
     context = {
         "req_ids": ["new"],
         "prev_req_id_to_index": {},
         "state_correction_applied": False,
+        "oracle_kv_group_ids": [0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (1, 1), "slot_mapping": (1,)},
+        },
     }
 
     validate_async_state_snapshot(tensors=tensors, context=context)
@@ -237,6 +328,10 @@ def test_validate_async_state_snapshot_rejects_unpaired_kv_group():
         "req_ids": ["new"],
         "prev_req_id_to_index": {},
         "state_correction_applied": False,
+        "oracle_kv_group_ids": [0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (1, 1), "slot_mapping": (1,)},
+        },
     }
 
     with pytest.raises(AssertionError, match="KV group snapshot is incomplete"):
@@ -252,12 +347,172 @@ def test_validate_async_state_snapshot_rejects_request_mapping_mismatch():
         "num_computed_before": [100],
         "num_computed_after": [101],
         "num_accepted_tokens": [1],
+        "group_0_block_table": [[1]],
+        "group_0_slot_mapping": [8],
     }
     context = {
         "req_ids": ["a"],
         "prev_req_id_to_index": {"a": 0},
         "state_correction_applied": True,
+        "oracle_kv_group_ids": [0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (1, 1), "slot_mapping": (1,)},
+        },
     }
 
     with pytest.raises(AssertionError, match="request mapping mismatch"):
+        validate_async_state_snapshot(tensors=tensors, context=context)
+
+
+def test_validate_async_state_snapshot_rejects_non_vector_state():
+    tensors = {
+        "prev_positions": [[-1]],
+        "prev_num_draft_tokens": [],
+        "prev_valid_sampled_token_count": [],
+        "cpu_num_computed_tokens": [7],
+        "num_computed_before": [],
+        "num_computed_after": [7],
+        "num_accepted_tokens": [1],
+        "group_0_block_table": [[1]],
+        "group_0_slot_mapping": [8],
+    }
+    context = {
+        "req_ids": ["new"],
+        "prev_req_id_to_index": {},
+        "state_correction_applied": False,
+        "oracle_kv_group_ids": [0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (1, 1), "slot_mapping": (1,)},
+        },
+    }
+
+    with pytest.raises(AssertionError, match="one-dimensional"):
+        validate_async_state_snapshot(tensors=tensors, context=context)
+
+
+def test_validate_async_state_snapshot_rejects_non_dense_previous_mapping():
+    tensors = {
+        "prev_positions": [1],
+        "prev_num_draft_tokens": [3],
+        "prev_valid_sampled_token_count": [1],
+        "cpu_num_computed_tokens": [104],
+        "num_computed_before": [100],
+        "num_computed_after": [101],
+        "num_accepted_tokens": [1],
+        "group_0_block_table": [[1]],
+        "group_0_slot_mapping": [8],
+    }
+    context = {
+        "req_ids": ["a"],
+        "prev_req_id_to_index": {"a": 1},
+        "state_correction_applied": True,
+        "oracle_kv_group_ids": [0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (1, 1), "slot_mapping": (1,)},
+        },
+    }
+
+    with pytest.raises(AssertionError, match="previous request mapping"):
+        validate_async_state_snapshot(tensors=tensors, context=context)
+
+
+def test_validate_async_state_snapshot_rejects_missing_expected_kv_group():
+    tensors = {
+        "prev_positions": [-1],
+        "prev_num_draft_tokens": [],
+        "prev_valid_sampled_token_count": [],
+        "cpu_num_computed_tokens": [7],
+        "num_computed_before": [],
+        "num_computed_after": [7],
+        "num_accepted_tokens": [1],
+    }
+    context = {
+        "req_ids": ["new"],
+        "prev_req_id_to_index": {},
+        "state_correction_applied": False,
+        "oracle_kv_group_ids": [0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (1, 1), "slot_mapping": (1,)},
+        },
+    }
+
+    with pytest.raises(AssertionError, match="KV group set"):
+        validate_async_state_snapshot(tensors=tensors, context=context)
+
+
+def test_validate_async_state_snapshot_rejects_kv_shape_mismatch():
+    tensors = {
+        "prev_positions": [-1],
+        "prev_num_draft_tokens": [],
+        "prev_valid_sampled_token_count": [],
+        "cpu_num_computed_tokens": [7],
+        "num_computed_before": [],
+        "num_computed_after": [7],
+        "num_accepted_tokens": [1],
+        "group_0_block_table": [[1], [2]],
+        "group_0_slot_mapping": [8],
+    }
+    context = {
+        "req_ids": ["new"],
+        "prev_req_id_to_index": {},
+        "state_correction_applied": False,
+        "oracle_kv_group_ids": [0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (1, 1), "slot_mapping": (1,)},
+        },
+    }
+
+    with pytest.raises(AssertionError, match="block_table shape"):
+        validate_async_state_snapshot(tensors=tensors, context=context)
+
+
+def test_validate_async_state_snapshot_rejects_kv_request_row_mismatch():
+    tensors = {
+        "prev_positions": [-1],
+        "prev_num_draft_tokens": [],
+        "prev_valid_sampled_token_count": [],
+        "cpu_num_computed_tokens": [7],
+        "num_computed_before": [],
+        "num_computed_after": [7],
+        "num_accepted_tokens": [1],
+        "group_0_block_table": [[1], [2]],
+        "group_0_slot_mapping": [8],
+    }
+    context = {
+        "req_ids": ["new"],
+        "prev_req_id_to_index": {},
+        "state_correction_applied": False,
+        "oracle_kv_group_ids": [0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (2, 1), "slot_mapping": (1,)},
+        },
+    }
+
+    with pytest.raises(AssertionError, match="request rows"):
+        validate_async_state_snapshot(tensors=tensors, context=context)
+
+
+def test_validate_async_state_snapshot_rejects_duplicate_expected_kv_group():
+    tensors = {
+        "prev_positions": [-1],
+        "prev_num_draft_tokens": [],
+        "prev_valid_sampled_token_count": [],
+        "cpu_num_computed_tokens": [7],
+        "num_computed_before": [],
+        "num_computed_after": [7],
+        "num_accepted_tokens": [1],
+        "group_0_block_table": [[1]],
+        "group_0_slot_mapping": [8],
+    }
+    context = {
+        "req_ids": ["new"],
+        "prev_req_id_to_index": {},
+        "state_correction_applied": False,
+        "oracle_kv_group_ids": [0, 0],
+        "oracle_kv_group_shapes": {
+            0: {"block_table": (1, 1), "slot_mapping": (1,)},
+        },
+    }
+
+    with pytest.raises(AssertionError, match="duplicate KV group"):
         validate_async_state_snapshot(tensors=tensors, context=context)

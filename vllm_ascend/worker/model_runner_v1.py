@@ -1185,6 +1185,13 @@ class NPUModelRunner(GPUModelRunner):
                 "prev_req_id_to_index": dict(prev_req_id_to_index or {}),
                 "state_correction_applied": state_correction_applied,
             }
+            if _gemma4_mtp_oracle_enabled(self.drafter):
+                self._gemma4_mtp_async_debug_context.update(
+                    {
+                        "oracle_kv_group_ids": [],
+                        "oracle_kv_group_shapes": {},
+                    }
+                )
         else:
             self._gemma4_mtp_async_debug_tensors = {}
             self._gemma4_mtp_async_debug_context = None
@@ -2585,6 +2592,15 @@ class NPUModelRunner(GPUModelRunner):
         self._gemma4_mtp_async_profile_context = None
         use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.drafter)
         use_gemma4_mtp_oracle = _gemma4_mtp_oracle_enabled(self.drafter)
+        if (
+            _GEMMA4_MTP_ORACLE
+            and self.speculative_config is not None
+            and self.speculative_config.use_gemma4_mtp()
+            and not use_gemma4_mtp_oracle
+        ):
+            raise AssertionError(
+                "Gemma4 oracle requires AscendGemma4Proposer"
+            )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -3696,19 +3712,98 @@ class NPUModelRunner(GPUModelRunner):
                     cm.block_table_tensor,
                     cm.slot_mapping,
                 )
-                if _gemma4_mtp_debug_enabled(self.drafter) or (
-                    _gemma4_mtp_oracle_enabled(self.drafter)
+                oracle_kv_context = (
+                    self._gemma4_mtp_async_debug_context
+                    if _gemma4_mtp_oracle_enabled(self.drafter)
                     and self.use_async_spec_decode
+                    else None
+                )
+                if (
+                    _gemma4_mtp_debug_enabled(self.drafter)
+                    or oracle_kv_context is not None
                 ):
                     debug_tensors = self._gemma4_mtp_async_debug_tensors
+                    block_table_key = f"group_{kv_cache_gid}_block_table"
+                    slot_mapping_key = f"group_{kv_cache_gid}_slot_mapping"
+                    if oracle_kv_context is not None and (
+                        block_table_key in debug_tensors
+                        or slot_mapping_key in debug_tensors
+                    ):
+                        raise AssertionError(
+                            "duplicate Gemma4 oracle KV group capture: "
+                            f"group_id={kv_cache_gid}"
+                        )
+                    block_table_snapshot = None
+                    block_table_expected_shape = None
                     if cm.block_table_tensor is not None:
-                        debug_tensors[f"group_{kv_cache_gid}_block_table"] = (
-                            cm.block_table_tensor[:num_reqs, :4].clone()
+                        block_table_expected_shape = (
+                            num_reqs,
+                            min(int(cm.block_table_tensor.shape[1]), 4),
                         )
+                        block_table_snapshot = cm.block_table_tensor[
+                            :num_reqs, :4
+                        ].clone()
+                        if oracle_kv_context is not None and (
+                            tuple(block_table_snapshot.shape)
+                            != block_table_expected_shape
+                        ):
+                            raise AssertionError(
+                                "Gemma4 oracle block table preview shape "
+                                f"mismatch: expected={block_table_expected_shape} "
+                                f"actual={tuple(block_table_snapshot.shape)}"
+                            )
+                        debug_tensors[block_table_key] = block_table_snapshot
+                    slot_mapping_snapshot = None
+                    slot_mapping_expected_shape = None
                     if cm.slot_mapping is not None:
-                        debug_tensors[f"group_{kv_cache_gid}_slot_mapping"] = (
-                            cm.slot_mapping.reshape(-1)[:16].clone()
+                        slot_mapping_expected_shape = (
+                            min(num_tokens_padded, 16),
                         )
+                        slot_mapping_snapshot = cm.slot_mapping.reshape(-1)[
+                            :16
+                        ].clone()
+                        if oracle_kv_context is not None and (
+                            tuple(slot_mapping_snapshot.shape)
+                            != slot_mapping_expected_shape
+                        ):
+                            raise AssertionError(
+                                "Gemma4 oracle slot mapping preview shape "
+                                f"mismatch: expected={slot_mapping_expected_shape} "
+                                f"actual={tuple(slot_mapping_snapshot.shape)}"
+                            )
+                        debug_tensors[slot_mapping_key] = slot_mapping_snapshot
+                    if oracle_kv_context is not None:
+                        oracle_kv_group_ids = oracle_kv_context.get(
+                            "oracle_kv_group_ids"
+                        )
+                        oracle_kv_group_shapes = oracle_kv_context.get(
+                            "oracle_kv_group_shapes"
+                        )
+                        assert isinstance(oracle_kv_group_ids, list)
+                        assert isinstance(oracle_kv_group_shapes, dict)
+                        if (
+                            kv_cache_gid in oracle_kv_group_ids
+                            or kv_cache_gid in oracle_kv_group_shapes
+                        ):
+                            raise AssertionError(
+                                "duplicate Gemma4 oracle KV group metadata: "
+                                f"group_id={kv_cache_gid}"
+                            )
+                        if (
+                            block_table_snapshot is None
+                            or slot_mapping_snapshot is None
+                            or block_table_expected_shape is None
+                            or slot_mapping_expected_shape is None
+                        ):
+                            raise AssertionError(
+                                "incomplete Gemma4 oracle KV group snapshot: "
+                                f"group_id={kv_cache_gid}"
+                            )
+                        oracle_kv_group_ids.append(kv_cache_gid)
+                        oracle_kv_group_shapes[kv_cache_gid] = {
+                            "block_table": block_table_expected_shape,
+                            "slot_mapping": slot_mapping_expected_shape,
+                        }
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)

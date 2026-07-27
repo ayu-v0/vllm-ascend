@@ -24,6 +24,13 @@ _GROUP_KEY = re.compile(
 )
 
 
+def select_full_vocab_processed_logits(processed_logits: Any) -> Any | None:
+    if isinstance(processed_logits, tuple):
+        logits, indices = processed_logits
+        return logits if indices is None else None
+    return processed_logits
+
+
 def _to_python(value: Any, name: str) -> Any:
     device = getattr(value, "device", None)
     if device is not None and getattr(device, "type", None) != "cpu":
@@ -43,6 +50,15 @@ def _flatten(value: Any) -> list[Any]:
 
 def _flat_ints(value: Any, name: str) -> list[int]:
     return [int(item) for item in _flatten(_to_python(value, name))]
+
+
+def _vector_ints(value: Any, name: str) -> list[int]:
+    data = _to_python(value, name)
+    if not isinstance(data, (list, tuple)) or any(
+        isinstance(item, (list, tuple)) for item in data
+    ):
+        raise AssertionError(f"Gemma4 oracle {name} must be one-dimensional")
+    return [int(item) for item in data]
 
 
 def _nested_ints(value: Any, name: str) -> list[list[int]]:
@@ -67,6 +83,33 @@ def _nested_floats(value: Any, name: str) -> list[list[float]]:
             raise AssertionError(f"Gemma4 oracle {name} must be two-dimensional")
         rows.append([float(item) for item in row])
     return rows
+
+
+def _value_shape(value: Any, name: str) -> tuple[int, ...]:
+    data = _to_python(value, name)
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(int(dimension) for dimension in shape)
+
+    def _infer(item: Any) -> tuple[int, ...]:
+        if not isinstance(item, (list, tuple)):
+            return ()
+        if not item:
+            return (0,)
+        child_shapes = [_infer(child) for child in item]
+        if any(child_shape != child_shapes[0] for child_shape in child_shapes[1:]):
+            raise AssertionError(f"Gemma4 oracle {name} has a ragged shape")
+        return (len(item), *child_shapes[0])
+
+    return _infer(data)
+
+
+def _expected_shape(value: Any, name: str) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(dimension, int) and dimension >= 0 for dimension in value
+    ):
+        raise AssertionError(f"Gemma4 oracle {name} shape metadata is invalid")
+    return tuple(value)
 
 
 def reconstruct_greedy_output(
@@ -148,6 +191,7 @@ def validate_greedy_oracle_snapshot(
     )
 
     counts = context.get("oracle_num_draft_tokens")
+    req_ids = context.get("oracle_req_ids")
     max_spec_len = context.get("oracle_max_spec_len")
     vocab_size = context.get("oracle_vocab_size")
     if not isinstance(counts, list) or not all(
@@ -156,6 +200,15 @@ def validate_greedy_oracle_snapshot(
         raise AssertionError("oracle_num_draft_tokens must be a list[int]")
     if not isinstance(max_spec_len, int) or not isinstance(vocab_size, int):
         raise AssertionError("oracle max_spec_len/vocab_size metadata is invalid")
+    if (
+        not isinstance(req_ids, list)
+        or len(req_ids) != len(counts)
+        or not all(isinstance(req_id, str) for req_id in req_ids)
+    ):
+        raise AssertionError(
+            f"oracle request rows do not match draft counts: "
+            f"req_ids={req_ids} counts={counts}"
+        )
     if len(top2_ids) != len(target) or len(top2_values) != len(target):
         raise AssertionError(
             "top2 row count does not match target tokens: "
@@ -214,11 +267,17 @@ def validate_greedy_oracle_snapshot(
             f"actual={parsed}"
         )
     if valid_sampled_token_count is not None:
-        actual_counts = _flat_ints(
+        actual_counts = _vector_ints(
             valid_sampled_token_count, "valid_sampled_token_count"
         )
         expected_counts = [len(row) for row in expected_parsed]
-        if actual_counts[: len(expected_counts)] != expected_counts:
+        if len(actual_counts) != len(expected_counts):
+            raise AssertionError(
+                "Gemma4 valid count rows do not match oracle output: "
+                f"expected_rows={len(expected_counts)} "
+                f"actual_rows={len(actual_counts)}"
+            )
+        if actual_counts != expected_counts:
             raise AssertionError(
                 "Gemma4 valid count does not match oracle output: "
                 f"expected={expected_counts} actual={actual_counts}"
@@ -242,7 +301,7 @@ def validate_async_state_snapshot(
     missing = sorted(required - set(tensors))
     if missing:
         raise AssertionError(f"Gemma4 async state tensors are missing: {missing}")
-    values = {name: _flat_ints(tensors[name], name) for name in required}
+    values = {name: _vector_ints(tensors[name], name) for name in required}
 
     req_ids = context.get("req_ids")
     previous = context.get("prev_req_id_to_index")
@@ -251,6 +310,10 @@ def validate_async_state_snapshot(
         raise AssertionError("Gemma4 async request mapping metadata is invalid")
     if not isinstance(applied, bool):
         raise AssertionError("state_correction_applied must be bool")
+    if not all(isinstance(req_id, str) for req_id in req_ids) or len(
+        set(req_ids)
+    ) != len(req_ids):
+        raise AssertionError("Gemma4 async request IDs must be unique strings")
 
     current_rows = len(req_ids)
     for name in (
@@ -269,6 +332,19 @@ def validate_async_state_snapshot(
         or len(values["prev_valid_sampled_token_count"]) != previous_rows
     ):
         raise AssertionError("previous-state tensor sizes are inconsistent")
+    previous_indices = list(previous.values())
+    if (
+        len(previous) != previous_rows
+        or not all(
+            isinstance(req_id, str) and isinstance(index, int)
+            for req_id, index in previous.items()
+        )
+        or sorted(previous_indices) != list(range(previous_rows))
+    ):
+        raise AssertionError(
+            "previous request mapping must contain each previous row exactly "
+            f"once: mapping={previous} previous_rows={previous_rows}"
+        )
 
     for row, req_id in enumerate(req_ids):
         expected_previous = int(previous.get(req_id, -1))
@@ -312,6 +388,22 @@ def validate_async_state_snapshot(
                 f"actual={values['num_computed_after'][row]}"
             )
 
+    expected_group_ids = context.get("oracle_kv_group_ids")
+    expected_group_shapes = context.get("oracle_kv_group_shapes")
+    if not isinstance(expected_group_ids, list) or not all(
+        isinstance(group_id, int) and group_id >= 0
+        for group_id in expected_group_ids
+    ):
+        raise AssertionError("Gemma4 oracle KV group IDs are invalid")
+    if not expected_group_ids:
+        raise AssertionError("Gemma4 oracle KV group set must not be empty")
+    if len(set(expected_group_ids)) != len(expected_group_ids):
+        raise AssertionError(
+            f"duplicate KV group IDs in oracle context: {expected_group_ids}"
+        )
+    if not isinstance(expected_group_shapes, dict):
+        raise AssertionError("Gemma4 oracle KV group shape metadata is invalid")
+
     groups: dict[int, set[str]] = {}
     for name in tensors:
         match = _GROUP_KEY.match(name)
@@ -326,3 +418,48 @@ def validate_async_state_snapshot(
     }
     if incomplete:
         raise AssertionError(f"KV group snapshot is incomplete: {incomplete}")
+    expected_group_set = set(expected_group_ids)
+    if set(groups) != expected_group_set:
+        raise AssertionError(
+            "KV group set does not match oracle context: "
+            f"expected={sorted(expected_group_set)} actual={sorted(groups)}"
+        )
+    if set(expected_group_shapes) != expected_group_set:
+        raise AssertionError(
+            "KV group shape metadata does not match expected groups: "
+            f"groups={expected_group_ids} shapes={expected_group_shapes}"
+        )
+    for group_id in expected_group_ids:
+        shape_metadata = expected_group_shapes[group_id]
+        if not isinstance(shape_metadata, dict) or set(shape_metadata) != {
+            "block_table",
+            "slot_mapping",
+        }:
+            raise AssertionError(
+                f"KV group {group_id} shape metadata is incomplete: "
+                f"{shape_metadata}"
+            )
+        for kind in ("block_table", "slot_mapping"):
+            name = f"group_{group_id}_{kind}"
+            expected_shape = _expected_shape(
+                shape_metadata[kind], f"KV group {group_id} {kind}"
+            )
+            if kind == "block_table" and (
+                len(expected_shape) != 2
+                or expected_shape[0] != current_rows
+            ):
+                raise AssertionError(
+                    f"KV group {group_id} block_table request rows do not "
+                    f"match requests={current_rows}: shape={expected_shape}"
+                )
+            if kind == "slot_mapping" and len(expected_shape) != 1:
+                raise AssertionError(
+                    f"KV group {group_id} slot_mapping must be one-dimensional: "
+                    f"shape={expected_shape}"
+                )
+            actual_shape = _value_shape(tensors[name], name)
+            if actual_shape != expected_shape:
+                raise AssertionError(
+                    f"KV group {group_id} {kind} shape mismatch: "
+                    f"expected={expected_shape} actual={actual_shape}"
+                )

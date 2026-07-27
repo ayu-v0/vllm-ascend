@@ -31,6 +31,9 @@ from vllm_ascend.ops.triton.reject_sample import (
 )
 from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+from vllm_ascend.spec_decode.gemma4_oracle import (
+    select_full_vocab_processed_logits,
+)
 
 
 _GEMMA4_MTP_DEBUG = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_DEBUG
@@ -220,15 +223,16 @@ class AscendRejectionSampler(RejectionSampler):
         target_logits = apply_sampling_constraints(
             target_logits, metadata.cu_num_draft_tokens, sampling_metadata, self.top_k
         )
+        oracle_target_logits = select_full_vocab_processed_logits(target_logits)
         capture_gemma4_oracle = (
             _GEMMA4_MTP_ORACLE
             and sampling_metadata.all_greedy
-            and not isinstance(target_logits, tuple)
+            and oracle_target_logits is not None
         )
         oracle_top2_ids = oracle_top2_values = oracle_target_argmax = None
         if capture_gemma4_oracle:
             oracle_top2_values, oracle_top2_ids = torch.topk(
-                target_logits.float(), k=2, dim=-1
+                oracle_target_logits.float(), k=2, dim=-1
             )
             oracle_target_argmax = oracle_top2_ids[:, 0].to(torch.int32)
         processed_target_top_ids = processed_target_top_values = None

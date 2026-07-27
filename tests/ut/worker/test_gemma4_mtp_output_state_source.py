@@ -196,6 +196,8 @@ def test_gemma4_runner_transports_oracle_without_async_host_reads():
     source = _method_source("sample_tokens")
 
     assert "use_gemma4_mtp_oracle = _gemma4_mtp_oracle_enabled" in source
+    assert "self.speculative_config.use_gemma4_mtp()" in source
+    assert "Gemma4 oracle requires AscendGemma4Proposer" in source
     assert "take_gemma4_oracle_snapshot()" in source
     assert "oracle_debug_tensors" in source
     assert "oracle_debug_context" in source
@@ -215,6 +217,8 @@ def test_gemma4_oracle_state_snapshot_owns_previous_correction_inputs():
     assert '"prev_valid_sampled_token_count"' in source
     assert '"cpu_num_computed_tokens"' in source
     assert '"state_correction_applied"' in source
+    assert '"oracle_kv_group_ids"' in source
+    assert '"oracle_kv_group_shapes"' in source
 
 
 def test_gemma4_oracle_collects_per_group_kv_state_for_async_validation():
@@ -222,6 +226,13 @@ def test_gemma4_oracle_collects_per_group_kv_state_for_async_validation():
 
     assert "_gemma4_mtp_oracle_enabled(self.drafter)" in source
     assert "and self.use_async_spec_decode" in source
+    assert "oracle_kv_group_ids" in source
+    assert "oracle_kv_group_shapes" in source
+    assert "duplicate Gemma4 oracle KV group" in source
+    assert "block_table_expected_shape = (" in source
+    assert "slot_mapping_expected_shape = (" in source
+    assert "tuple(block_table_snapshot.shape)" in source
+    assert "tuple(slot_mapping_snapshot.shape)" in source
     assert 'f"group_{kv_cache_gid}_block_table"' in source
     assert 'f"group_{kv_cache_gid}_slot_mapping"' in source
 
