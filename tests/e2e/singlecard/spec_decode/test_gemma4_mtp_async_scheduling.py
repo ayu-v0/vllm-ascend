@@ -90,6 +90,7 @@ def gemma4_server(
     use_mtp: bool,
     num_speculative_tokens: int = NUM_SPECULATIVE_TOKENS,
     executor_backend: str = "uni",
+    batch_invariant: bool = False,
     completed_head: bool = False,
     async_uniproc_submit: bool = False,
     enable_responses_store: bool = False,
@@ -97,6 +98,7 @@ def gemma4_server(
     assert MODEL is not None
     port = get_open_port()
     env_dict = {
+        "VLLM_BATCH_INVARIANT": "1" if batch_invariant else "0",
         "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX": (
             "1" if completed_head else "0"
         ),
@@ -284,18 +286,21 @@ def test_greedy_target_sync_async_equivalence(num_speculative_tokens: int):
         async_scheduling=False,
         use_mtp=False,
         num_speculative_tokens=num_speculative_tokens,
+        batch_invariant=True,
     ) as target_server:
         target = _completion(target_server, prompt)
     with gemma4_server(
         async_scheduling=False,
         use_mtp=True,
         num_speculative_tokens=num_speculative_tokens,
+        batch_invariant=True,
     ) as sync_server:
         sync = _completion(sync_server, prompt)
     with gemma4_server(
         async_scheduling=True,
         use_mtp=True,
         num_speculative_tokens=num_speculative_tokens,
+        batch_invariant=True,
     ) as async_server:
         async_result = _completion(async_server, prompt)
 
@@ -317,12 +322,20 @@ def test_greedy_token_ids_match_sync_and_async_without_padding():
     prompt = "请用三句话解释为什么幂等接口可以安全重试。"
     eos_prompt = "Reply with exactly this word: OK"
     stop_prompt = "Reply with exactly: alpha [MTP-END] beta"
-    with gemma4_server(async_scheduling=False, use_mtp=True) as sync_server:
+    with gemma4_server(
+        async_scheduling=False,
+        use_mtp=True,
+        batch_invariant=True,
+    ) as sync_server:
         sync = _completion(sync_server, prompt)
         sync_max_tokens = _completion(sync_server, prompt, max_tokens=1)
         sync_eos = _completion(sync_server, eos_prompt, max_tokens=32)
         sync_stop = _completion(sync_server, stop_prompt, max_tokens=32, stop=["[MTP-END]"])
-    with gemma4_server(async_scheduling=True, use_mtp=True) as async_server:
+    with gemma4_server(
+        async_scheduling=True,
+        use_mtp=True,
+        batch_invariant=True,
+    ) as async_server:
         async_result = _completion(async_server, prompt)
         async_max_tokens = _completion(async_server, prompt, max_tokens=1)
         async_eos = _completion(async_server, eos_prompt, max_tokens=32)
