@@ -184,11 +184,22 @@ def validate_greedy_oracle_snapshot(
                     break
             if mismatch is not None:
                 break
+        req_ids = context.get("oracle_req_ids")
+        mismatch_req_id = None
+        if (
+            mismatch is not None
+            and isinstance(req_ids, list)
+            and mismatch[0] < len(req_ids)
+        ):
+            mismatch_req_id = req_ids[mismatch[0]]
         margins = [row[0] - row[1] for row in top2_values]
         raise AssertionError(
             "Gemma4 greedy oracle mismatch: "
-            f"trace_id={context.get('trace_id')} mismatch={mismatch} "
+            f"trace_id={context.get('trace_id')} req_id={mismatch_req_id} "
+            f"mismatch={mismatch} "
             f"num_draft_tokens={counts} expected={expected} actual={actual} "
+            f"target_argmax={target} draft_token_ids={draft} "
+            f"bonus_token_ids={bonus} "
             f"top2_ids={top2_ids} top2_values={top2_values} margins={margins}"
         )
 

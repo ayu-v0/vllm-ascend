@@ -135,6 +135,10 @@ from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
 from vllm_ascend.spec_decode.gemma4_proposer import AscendGemma4Proposer
+from vllm_ascend.spec_decode.gemma4_oracle import (
+    validate_async_state_snapshot,
+    validate_greedy_oracle_snapshot,
+)
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
@@ -187,6 +191,7 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 _GEMMA4_MTP_DEBUG = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_DEBUG
+_GEMMA4_MTP_ORACLE = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_ORACLE
 
 
 def _debug_shape(value: Any) -> tuple[int, ...] | None:
@@ -312,6 +317,10 @@ def _gemma4_mtp_debug_enabled(drafter: Any) -> bool:
     return _GEMMA4_MTP_DEBUG and isinstance(drafter, AscendGemma4Proposer)
 
 
+def _gemma4_mtp_oracle_enabled(drafter: Any) -> bool:
+    return _GEMMA4_MTP_ORACLE and isinstance(drafter, AscendGemma4Proposer)
+
+
 def _gemma4_mtp_async_profile_enabled(drafter: Any) -> bool:
     return envs_ascend.VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE and isinstance(
         drafter, AscendGemma4Proposer
@@ -374,6 +383,25 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+
+
+class _Gemma4OracleAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
+    def get_output(self) -> ModelRunnerOutput:
+        output = super().get_output()
+        context = self.debug_context
+        if context is None or not context.get("gemma4_oracle_enabled", False):
+            return output
+        validate_greedy_oracle_snapshot(
+            tensors=self.debug_tensors_cpu,
+            context=context,
+            parsed_token_ids=output.sampled_token_ids,
+            valid_sampled_token_count=self.valid_sampled_token_count_cpu,
+        )
+        validate_async_state_snapshot(
+            tensors=self.debug_tensors_cpu,
+            context=context,
+        )
+        return output
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -1087,25 +1115,38 @@ class NPUModelRunner(GPUModelRunner):
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
 
-        debug_async_state = (
+        trace_async_state = (
             _gemma4_mtp_debug_enabled(self.drafter)
-            and self.use_async_spec_decode
-        )
+            or _gemma4_mtp_oracle_enabled(self.drafter)
+        ) and self.use_async_spec_decode
+        previous_rows = len(prev_req_id_to_index or {})
         num_computed_before = (
-            self.num_computed_tokens.clone() if debug_async_state else None
+            self.num_computed_tokens[:previous_rows].clone()
+            if trace_async_state
+            else None
         )
+        state_correction_applied = (
+            self.use_async_spec_decode
+            and self.valid_sampled_token_count_gpu is not None
+            and bool(prev_req_id_to_index)
+        )
+        prev_valid_sampled_token_count: torch.Tensor | None = None
+        if trace_async_state:
+            prev_valid_sampled_token_count = (
+                self.valid_sampled_token_count_gpu[:previous_rows].clone()
+                if state_correction_applied
+                else torch.empty(0, dtype=torch.int32, device=self.device)
+            )
+        cpu_values = None
 
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
-        if (
-            self.use_async_spec_decode
-            and self.valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
-        ):
+        if state_correction_applied or trace_async_state:
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
+        if state_correction_applied:
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
                 device=self.device, non_blocking=True
             )
@@ -1123,11 +1164,18 @@ class NPUModelRunner(GPUModelRunner):
                 non_blocking=True,
             )
 
-        if debug_async_state:
+        if trace_async_state:
             assert num_computed_before is not None
+            assert prev_valid_sampled_token_count is not None
+            if cpu_values is None:
+                cpu_values = self.num_computed_tokens[:num_reqs].clone()
             self._gemma4_mtp_async_debug_tensors = {
                 "prev_positions": self.prev_positions.gpu[:num_reqs].clone(),
-                "prev_num_draft_tokens": self.prev_num_draft_tokens.gpu.clone(),
+                "prev_num_draft_tokens": self.prev_num_draft_tokens.gpu[
+                    :previous_rows
+                ].clone(),
+                "prev_valid_sampled_token_count": prev_valid_sampled_token_count,
+                "cpu_num_computed_tokens": cpu_values.clone(),
                 "num_computed_before": num_computed_before,
                 "num_computed_after": self.num_computed_tokens[:num_reqs].clone(),
                 "num_accepted_tokens": self.num_accepted_tokens.gpu[:num_reqs].clone(),
@@ -1135,6 +1183,7 @@ class NPUModelRunner(GPUModelRunner):
             self._gemma4_mtp_async_debug_context = {
                 "req_ids": self.input_batch.req_ids[:num_reqs].copy(),
                 "prev_req_id_to_index": dict(prev_req_id_to_index or {}),
+                "state_correction_applied": state_correction_applied,
             }
         else:
             self._gemma4_mtp_async_debug_tensors = {}
@@ -2535,6 +2584,7 @@ class NPUModelRunner(GPUModelRunner):
         profile_context = getattr(self, "_gemma4_mtp_async_profile_context", None)
         self._gemma4_mtp_async_profile_context = None
         use_gemma4_mtp_debug = _gemma4_mtp_debug_enabled(self.drafter)
+        use_gemma4_mtp_oracle = _gemma4_mtp_oracle_enabled(self.drafter)
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2548,6 +2598,16 @@ class NPUModelRunner(GPUModelRunner):
         sampling_start = time.perf_counter() if profile_context is not None else 0.0
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        oracle_debug_tensors: dict[str, torch.Tensor] = {}
+        oracle_debug_context: dict[str, object] | None = None
+        if use_gemma4_mtp_oracle and spec_decode_metadata is not None:
+            oracle_debug_tensors, oracle_debug_context = (
+                self.rejection_sampler.take_gemma4_oracle_snapshot()
+            )
+            if oracle_debug_context is None:
+                raise AssertionError(
+                    "Gemma4 greedy oracle snapshot was not produced"
+                )
         if profile_context is not None:
             profile_context["sampling_ms"] = (time.perf_counter() - sampling_start) * 1000.0
 
@@ -2771,7 +2831,35 @@ class NPUModelRunner(GPUModelRunner):
             if pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
+        if oracle_debug_context is not None:
+            oracle_debug_context.update(
+                {
+                    "gemma4_oracle_enabled": True,
+                    "trace_id": getattr(
+                        self, "_gemma4_mtp_async_trace_id", None
+                    ),
+                    "oracle_req_ids": req_ids_output_copy,
+                    "oracle_vocab_size": self.input_batch.vocab_size,
+                }
+            )
+
         if not self.use_async_scheduling:
+            if oracle_debug_context is not None:
+                oracle_tensors_cpu = {
+                    name: tensor.detach().cpu()
+                    for name, tensor in oracle_debug_tensors.items()
+                }
+                current_valid_count_cpu = (
+                    self.valid_sampled_token_count_gpu.detach().cpu()
+                    if self.valid_sampled_token_count_gpu is not None
+                    else None
+                )
+                validate_greedy_oracle_snapshot(
+                    tensors=oracle_tensors_cpu,
+                    context=oracle_debug_context,
+                    parsed_token_ids=model_runner_output.sampled_token_ids,
+                    valid_sampled_token_count=current_valid_count_cpu,
+                )
             if profile_context is not None:
                 profile_context["sample_tokens_total_ms"] = (
                     time.perf_counter() - sampling_start
@@ -2809,16 +2897,24 @@ class NPUModelRunner(GPUModelRunner):
         )
         debug_tensors = None
         debug_context = None
-        if use_gemma4_mtp_debug:
+        if use_gemma4_mtp_debug or use_gemma4_mtp_oracle:
             debug_tensors = dict(self._gemma4_mtp_async_debug_tensors)
-            if torch.is_tensor(self._draft_token_ids):
+            debug_tensors.update(oracle_debug_tensors)
+            if use_gemma4_mtp_debug and torch.is_tensor(self._draft_token_ids):
                 debug_tensors["draft_token_ids"] = self._draft_token_ids.clone()
             debug_context = dict(self._gemma4_mtp_async_debug_context or {})
             debug_context["trace_id"] = getattr(
                 self, "_gemma4_mtp_async_trace_id", None
             )
+            if oracle_debug_context is not None:
+                debug_context.update(oracle_debug_context)
         async_output_launch_start = time.perf_counter() if profile_context is not None else 0.0
-        async_output = AsyncGPUModelRunnerOutput(
+        async_output_class = (
+            _Gemma4OracleAsyncGPUModelRunnerOutput
+            if oracle_debug_context is not None
+            else AsyncGPUModelRunnerOutput
+        )
+        async_output = async_output_class(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             logprobs_tensors=sampler_output.logprobs_tensors,
@@ -3600,7 +3696,10 @@ class NPUModelRunner(GPUModelRunner):
                     cm.block_table_tensor,
                     cm.slot_mapping,
                 )
-                if _gemma4_mtp_debug_enabled(self.drafter):
+                if _gemma4_mtp_debug_enabled(self.drafter) or (
+                    _gemma4_mtp_oracle_enabled(self.drafter)
+                    and self.use_async_spec_decode
+                ):
                     debug_tensors = self._gemma4_mtp_async_debug_tensors
                     if cm.block_table_tensor is not None:
                         debug_tensors[f"group_{kv_cache_gid}_block_table"] = (

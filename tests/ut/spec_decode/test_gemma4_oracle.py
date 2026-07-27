@@ -128,6 +128,38 @@ def test_validate_greedy_oracle_rejects_sampled_token_mismatch():
         )
 
 
+def test_validate_greedy_oracle_mismatch_reports_decision_chain():
+    tensors = _oracle_tensors(
+        target=[10],
+        draft=[11],
+        bonus=[20],
+        sampled=[[11, -1]],
+        top2_ids=[[10, 11]],
+        top2_values=[[1.000001, 1.0]],
+    )
+
+    with pytest.raises(AssertionError) as exc_info:
+        validate_greedy_oracle_snapshot(
+            tensors=tensors,
+            context={
+                "trace_id": 8,
+                "oracle_req_ids": ["req-8"],
+                "oracle_num_draft_tokens": [1],
+                "oracle_max_spec_len": 1,
+                "oracle_vocab_size": 100,
+            },
+            parsed_token_ids=[[11]],
+            valid_sampled_token_count=[1],
+        )
+
+    message = str(exc_info.value)
+    assert "req_id=req-8" in message
+    assert "target_argmax=[10]" in message
+    assert "draft_token_ids=[11]" in message
+    assert "bonus_token_ids=[20]" in message
+    assert "margins=" in message
+
+
 def test_validate_greedy_oracle_rejects_valid_count_mismatch():
     tensors = _oracle_tensors(
         target=[10],

@@ -21,6 +21,23 @@ def _method_source(method_name: str) -> str:
     raise AssertionError(f"{method_name} was not found")
 
 
+def _class_method_source(class_name: str, method_name: str) -> str:
+    text = SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    lines = text.splitlines()
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method_node = next(
+        node
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    )
+    return "\n".join(lines[method_node.lineno - 1 : method_node.end_lineno])
+
+
 def test_gemma4_mtp_enables_accepted_token_state_updates():
     source = _method_source("initialize_kv_cache")
 
@@ -119,7 +136,7 @@ def test_gemma4_mtp_collects_async_state_snapshots_without_early_host_reads():
     assert "debug_context=debug_context" in text
 
     prepare_source = _method_source("_prepare_inputs")
-    snapshot_start = prepare_source.index("debug_async_state =")
+    snapshot_start = prepare_source.index("trace_async_state =")
     snapshot_source = prepare_source[snapshot_start:]
     assert ".tolist()" not in snapshot_source
     assert ".cpu()" not in snapshot_source
@@ -160,6 +177,53 @@ def test_gemma4_oracle_snapshot_has_no_early_host_reads():
     assert ".tolist()" not in snapshot
     assert ".item()" not in snapshot
     assert "synchronize()" not in snapshot
+
+
+def test_gemma4_async_oracle_runs_after_base_copy_and_parse():
+    source = _class_method_source(
+        "_Gemma4OracleAsyncGPUModelRunnerOutput", "get_output"
+    )
+
+    assert "output = super().get_output()" in source
+    assert "validate_greedy_oracle_snapshot(" in source
+    assert "validate_async_state_snapshot(" in source
+    assert source.index("output = super().get_output()") < source.index(
+        "validate_greedy_oracle_snapshot("
+    )
+
+
+def test_gemma4_runner_transports_oracle_without_async_host_reads():
+    source = _method_source("sample_tokens")
+
+    assert "use_gemma4_mtp_oracle = _gemma4_mtp_oracle_enabled" in source
+    assert "take_gemma4_oracle_snapshot()" in source
+    assert "oracle_debug_tensors" in source
+    assert "oracle_debug_context" in source
+    assert "_Gemma4OracleAsyncGPUModelRunnerOutput" in source
+    async_start = source.index("debug_tensors = None")
+    async_source = source[async_start:]
+    assert ".cpu()" not in async_source
+
+
+def test_gemma4_oracle_state_snapshot_owns_previous_correction_inputs():
+    source = _method_source("_prepare_inputs")
+
+    assert "_gemma4_mtp_oracle_enabled(self.drafter)" in source
+    assert "if state_correction_applied or trace_async_state:" in source
+    assert "self.prev_positions.copy_to_gpu(num_reqs)" in source
+    assert "self.prev_num_draft_tokens.copy_to_gpu()" in source
+    assert '"prev_valid_sampled_token_count"' in source
+    assert '"cpu_num_computed_tokens"' in source
+    assert '"state_correction_applied"' in source
+
+
+def test_gemma4_oracle_collects_per_group_kv_state_for_async_validation():
+    source = _method_source("_build_attention_metadata")
+
+    assert "_gemma4_mtp_oracle_enabled(self.drafter)" in source
+    assert "and self.use_async_spec_decode" in source
+    assert 'f"group_{kv_cache_gid}_block_table"' in source
+    assert 'f"group_{kv_cache_gid}_slot_mapping"' in source
 
 
 if __name__ == "__main__":
