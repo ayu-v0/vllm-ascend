@@ -34,6 +34,7 @@ from vllm_ascend.sample.sampler import apply_top_k_top_p
 
 
 _GEMMA4_MTP_DEBUG = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_DEBUG
+_GEMMA4_MTP_ORACLE = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_ORACLE
 
 
 def _debug_token_preview(value: Any, max_rows: int = 2, max_cols: int = 8) -> Any:
@@ -122,11 +123,22 @@ class AscendRejectionSampler(RejectionSampler):
         else:
             self.top_k = None
 
-    def __init__(self, sampler):
+    def __init__(self, sampler: Sampler):
         super().__init__(sampler)
         # Store Ascend-specific optimizations
         self._ascend_optimizations_enabled = True
         self.top_k = None
+        self._gemma4_oracle_tensors: dict[str, torch.Tensor] = {}
+        self._gemma4_oracle_context: dict[str, object] | None = None
+
+    def take_gemma4_oracle_snapshot(
+        self,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, object] | None]:
+        tensors = self._gemma4_oracle_tensors
+        context = self._gemma4_oracle_context
+        self._gemma4_oracle_tensors = {}
+        self._gemma4_oracle_context = None
+        return tensors, context
 
     def forward(
         self,
@@ -160,6 +172,8 @@ class AscendRejectionSampler(RejectionSampler):
                 requested.
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+        self._gemma4_oracle_tensors = {}
+        self._gemma4_oracle_context = None
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
@@ -206,6 +220,17 @@ class AscendRejectionSampler(RejectionSampler):
         target_logits = apply_sampling_constraints(
             target_logits, metadata.cu_num_draft_tokens, sampling_metadata, self.top_k
         )
+        capture_gemma4_oracle = (
+            _GEMMA4_MTP_ORACLE
+            and sampling_metadata.all_greedy
+            and not isinstance(target_logits, tuple)
+        )
+        oracle_top2_ids = oracle_top2_values = oracle_target_argmax = None
+        if capture_gemma4_oracle:
+            oracle_top2_values, oracle_top2_ids = torch.topk(
+                target_logits.float(), k=2, dim=-1
+            )
+            oracle_target_argmax = oracle_top2_ids[:, 0].to(torch.int32)
         processed_target_top_ids = processed_target_top_values = None
         if _GEMMA4_MTP_DEBUG:
             if isinstance(target_logits, tuple):
@@ -227,6 +252,22 @@ class AscendRejectionSampler(RejectionSampler):
             bonus_token_ids,
             sampling_metadata,
         )
+        if capture_gemma4_oracle:
+            assert oracle_target_argmax is not None
+            assert oracle_top2_ids is not None
+            assert oracle_top2_values is not None
+            self._gemma4_oracle_tensors = {
+                "oracle_target_argmax": oracle_target_argmax.clone(),
+                "oracle_target_top2_ids": oracle_top2_ids.clone(),
+                "oracle_target_top2_values": oracle_top2_values.clone(),
+                "oracle_draft_token_ids": metadata.draft_token_ids.clone(),
+                "oracle_bonus_token_ids": bonus_token_ids.clone(),
+                "oracle_sampled_token_ids": output_token_ids.clone(),
+            }
+            self._gemma4_oracle_context = {
+                "oracle_num_draft_tokens": list(metadata.num_draft_tokens),
+                "oracle_max_spec_len": metadata.max_spec_len,
+            }
         if _GEMMA4_MTP_DEBUG:
             logger.warning(
                 "Gemma4 MTP debug: rejection_sampler target logits "

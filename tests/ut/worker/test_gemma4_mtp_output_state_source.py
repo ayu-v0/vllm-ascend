@@ -3,6 +3,12 @@ from pathlib import Path
 
 
 SOURCE = Path(__file__).parents[3] / "vllm_ascend" / "worker" / "model_runner_v1.py"
+REJECTION_SOURCE = (
+    Path(__file__).parents[3]
+    / "vllm_ascend"
+    / "sample"
+    / "rejection_sampler.py"
+)
 
 
 def _method_source(method_name: str) -> str:
@@ -117,6 +123,43 @@ def test_gemma4_mtp_collects_async_state_snapshots_without_early_host_reads():
     snapshot_source = prepare_source[snapshot_start:]
     assert ".tolist()" not in snapshot_source
     assert ".cpu()" not in snapshot_source
+
+
+def test_gemma4_oracle_snapshot_is_instance_owned_and_has_one_shot_handoff():
+    source = REJECTION_SOURCE.read_text(encoding="utf-8")
+
+    assert "_GEMMA4_MTP_ORACLE" in source
+    assert "self._gemma4_oracle_tensors" in source
+    assert "self._gemma4_oracle_context" in source
+    assert "def take_gemma4_oracle_snapshot(" in source
+    assert "self._gemma4_oracle_tensors = {}" in source
+    assert "self._gemma4_oracle_context = None" in source
+
+
+def test_gemma4_oracle_snapshot_has_no_early_host_reads():
+    source = REJECTION_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    rejection_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AscendRejectionSampler"
+    )
+    forward = next(
+        node
+        for node in rejection_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "forward"
+    )
+    body = "\n".join(lines[forward.lineno - 1 : forward.end_lineno])
+    snapshot = body[body.index("capture_gemma4_oracle =") :]
+
+    assert '"oracle_target_argmax"' in snapshot
+    assert '"oracle_target_top2_ids"' in snapshot
+    assert '"oracle_sampled_token_ids"' in snapshot
+    assert ".cpu()" not in snapshot
+    assert ".tolist()" not in snapshot
+    assert ".item()" not in snapshot
+    assert "synchronize()" not in snapshot
 
 
 if __name__ == "__main__":
