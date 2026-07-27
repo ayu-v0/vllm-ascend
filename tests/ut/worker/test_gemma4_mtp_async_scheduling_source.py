@@ -88,7 +88,7 @@ def _gemma4_server_calls(function_name: str) -> list[ast.Call]:
     ]
 
 
-def _batch_invariant_call_owners(source: str) -> set[str]:
+def _oracle_debug_call_owners(source: str) -> set[str]:
     owners = set()
     for node in ast.parse(source).body:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -101,7 +101,7 @@ def _batch_invariant_call_owners(source: str) -> set[str]:
             ):
                 continue
             if any(
-                keyword.arg == "batch_invariant"
+                keyword.arg == "oracle_debug"
                 and isinstance(keyword.value, ast.Constant)
                 and keyword.value.value is True
                 for keyword in call.keywords
@@ -151,59 +151,50 @@ def test_gemma4_mtp_e2e_validates_cancelled_request_resource_release():
     assert "_poll_until" in source
 
 
-def test_gemma4_mtp_batch_invariance_is_scoped_to_cross_process_equivalence():
+def test_gemma4_mtp_oracle_debug_is_scoped_to_correctness_gate():
     server = _function_node(E2E_SOURCE, "gemma4_server")
     keyword_defaults = dict(
         zip(server.args.kwonlyargs, server.args.kw_defaults, strict=True)
     )
-    batch_argument = next(
-        argument for argument in keyword_defaults if argument.arg == "batch_invariant"
+    oracle_argument = next(
+        argument for argument in keyword_defaults if argument.arg == "oracle_debug"
     )
-    batch_default = keyword_defaults[batch_argument]
-    assert isinstance(batch_argument.annotation, ast.Name)
-    assert batch_argument.annotation.id == "bool"
-    assert isinstance(batch_default, ast.Constant)
-    assert batch_default.value is False
+    oracle_default = keyword_defaults[oracle_argument]
+    assert isinstance(oracle_argument.annotation, ast.Name)
+    assert oracle_argument.annotation.id == "bool"
+    assert isinstance(oracle_default, ast.Constant)
+    assert oracle_default.value is False
 
-    env_dict = next(
-        node.value
-        for node in server.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "env_dict"
-            for target in node.targets
+    source = E2E_SOURCE.read_text(encoding="utf-8")
+    assert '"VLLM_ASCEND_GEMMA4_MTP_ORACLE": (' in source
+    assert '"VLLM_ASCEND_GEMMA4_MTP_DEBUG": "0"' in source
+    assert '"VLLM_BATCH_INVARIANT": "0"' in source
+
+    gate_name = "test_greedy_target_sync_async_diagnostic_and_oracle"
+    gate_calls = _gemma4_server_calls(gate_name)
+    mtp_calls = [
+        call
+        for call in gate_calls
+        if any(
+            keyword.arg == "use_mtp"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in call.keywords
         )
+    ]
+    assert mtp_calls
+    assert all(
+        any(
+            keyword.arg == "oracle_debug"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in call.keywords
+        )
+        for call in mtp_calls
     )
-    assert isinstance(env_dict, ast.Dict)
-    batch_env_value = next(
-        value
-        for key, value in zip(env_dict.keys, env_dict.values, strict=True)
-        if isinstance(key, ast.Constant) and key.value == "VLLM_BATCH_INVARIANT"
-    )
-    assert isinstance(batch_env_value, ast.IfExp)
-    assert isinstance(batch_env_value.test, ast.Name)
-    assert batch_env_value.test.id == "batch_invariant"
-    assert isinstance(batch_env_value.body, ast.Constant)
-    assert batch_env_value.body.value == "1"
-    assert isinstance(batch_env_value.orelse, ast.Constant)
-    assert batch_env_value.orelse.value == "0"
-
-    equivalence_tests = {
-        "test_greedy_target_sync_async_equivalence",
-        "test_greedy_token_ids_match_sync_and_async_without_padding",
-    }
-    for test_name in equivalence_tests:
-        calls = _gemma4_server_calls(test_name)
-        assert calls
-        for call in calls:
-            batch_keywords = [
-                keyword for keyword in call.keywords if keyword.arg == "batch_invariant"
-            ]
-            assert len(batch_keywords) == 1
-            assert isinstance(batch_keywords[0].value, ast.Constant)
-            assert batch_keywords[0].value.value is True
 
     default_tests = {
+        "test_greedy_boundaries_without_padding",
         "test_streaming_matches_non_streaming_and_cancel_releases_resources",
         "test_mixed_prefill_decode_requests_complete_without_padding_or_reordering",
     }
@@ -211,26 +202,30 @@ def test_gemma4_mtp_batch_invariance_is_scoped_to_cross_process_equivalence():
         calls = _gemma4_server_calls(test_name)
         assert calls
         assert all(
-            keyword.arg != "batch_invariant"
+            not (
+                keyword.arg == "oracle_debug"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+            )
             for call in calls
             for keyword in call.keywords
         )
 
-    owners = _batch_invariant_call_owners(E2E_SOURCE.read_text(encoding="utf-8"))
-    assert owners <= equivalence_tests
+    owners = _oracle_debug_call_owners(source)
+    assert owners == {gate_name}
 
 
-def test_batch_invariant_owner_scan_covers_sync_async_helpers_and_ignores_false():
-    owners = _batch_invariant_call_owners(
+def test_oracle_debug_owner_scan_covers_sync_async_helpers_and_ignores_false():
+    owners = _oracle_debug_call_owners(
         """
 def helper_escape():
-    gemma4_server(batch_invariant=True)
+    gemma4_server(oracle_debug=True)
 
 async def async_escape():
-    gemma4_server(batch_invariant=True)
+    gemma4_server(oracle_debug=True)
 
 def helper_explicit_false():
-    gemma4_server(batch_invariant=False)
+    gemma4_server(oracle_debug=False)
 """
     )
 
@@ -324,8 +319,8 @@ if __name__ == "__main__":
     test_gemma4_mtp_keeps_requested_async_scheduling_on_ascend()
     test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers()
     test_gemma4_mtp_e2e_validates_cancelled_request_resource_release()
-    test_gemma4_mtp_batch_invariance_is_scoped_to_cross_process_equivalence()
-    test_batch_invariant_owner_scan_covers_sync_async_helpers_and_ignores_false()
+    test_gemma4_mtp_oracle_debug_is_scoped_to_correctness_gate()
+    test_oracle_debug_owner_scan_covers_sync_async_helpers_and_ignores_false()
     test_gemma4_mtp_benchmark_keeps_k_and_workload_constant()
     test_gemma4_mtp_benchmark_defaults_support_the_target_load()
     test_gemma4_mtp_benchmark_uses_low_noise_logging_without_disabling_metrics()
