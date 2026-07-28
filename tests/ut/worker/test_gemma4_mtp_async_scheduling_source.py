@@ -51,7 +51,25 @@ def _find_vllm_engine_core_source() -> Path:
     raise AssertionError("Unable to locate the sibling vLLM EngineCore source")
 
 
+def _find_vllm_uniproc_executor_source() -> Path:
+    ascend_root = Path(__file__).parents[3]
+    suffix = Path("vllm") / "v1" / "executor" / "uniproc_executor.py"
+    direct_candidate = ascend_root.parent / "vllm" / suffix
+    if direct_candidate.is_file():
+        return direct_candidate
+
+    versioned_ascend_parent = ascend_root.parent
+    versioned_vllm_parent = versioned_ascend_parent.parent / versioned_ascend_parent.name.replace(
+        "vllm-ascend-", "vllm-", 1
+    )
+    versioned_candidate = versioned_vllm_parent / "vllm" / suffix
+    if versioned_candidate.is_file():
+        return versioned_candidate
+    raise AssertionError("Unable to locate the sibling vLLM UniProc source")
+
+
 VLLM_ENGINE_CORE_SOURCE = _find_vllm_engine_core_source()
+VLLM_UNIPROC_EXECUTOR_SOURCE = _find_vllm_uniproc_executor_source()
 
 
 def _method_source(method_name: str) -> str:
@@ -315,6 +333,35 @@ def test_gemma4_mtp_completed_head_ttft_fix_is_enabled_only_for_async_validation
     assert '"VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX=0"' in benchmark_source
 
 
+def test_gemma4_mtp_async_uniproc_submit_gate_is_scoped_and_default_off():
+    envs_source = ASCEND_ENVS_SOURCE.read_text(encoding="utf-8")
+    uniproc_source = VLLM_UNIPROC_EXECUTOR_SOURCE.read_text(encoding="utf-8")
+
+    assert '"VLLM_ASCEND_GEMMA4_MTP_ASYNC_UNIPROC_SUBMIT"' in envs_source
+    assert (
+        'os.getenv("VLLM_ASCEND_GEMMA4_MTP_ASYNC_UNIPROC_SUBMIT", "0")'
+        in envs_source
+    )
+    for token in (
+        "_should_enable_gemma4_mtp_async_uniproc_submit",
+        'device_type == "npu"',
+        'method == "mtp"',
+        'model_type == "gemma4"',
+        "type(self) is UniProcExecutor",
+        "max_workers=1",
+        "initializer=current_platform.set_device",
+        "command_future.add_done_callback(command_done)",
+        "output_future.add_done_callback(complete_public_future)",
+    ):
+        assert token in uniproc_source
+
+    assert "self.worker_command_thread: ThreadPoolExecutor | None = None" in uniproc_source
+    command_shutdown = uniproc_source.index("command_thread.shutdown(wait=True)")
+    output_shutdown = uniproc_source.index("output_thread.shutdown(wait=True)")
+    worker_shutdown = uniproc_source.index("worker.shutdown()")
+    assert command_shutdown < output_shutdown < worker_shutdown
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_keeps_requested_async_scheduling_on_ascend()
     test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers()
@@ -328,3 +375,4 @@ if __name__ == "__main__":
     test_gemma4_mtp_async_profile_is_sampled_and_passed_to_async_output()
     test_gemma4_mtp_completed_head_ttft_fix_is_scoped_and_nonblocking()
     test_gemma4_mtp_completed_head_ttft_fix_is_enabled_only_for_async_validation()
+    test_gemma4_mtp_async_uniproc_submit_gate_is_scoped_and_default_off()
