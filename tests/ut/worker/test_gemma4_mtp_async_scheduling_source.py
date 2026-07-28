@@ -310,27 +310,26 @@ def test_gemma4_mtp_async_profile_is_sampled_and_passed_to_async_output():
     assert "profile_iteration <= 8 or profile_iteration % profile_every == 0" in runner_source
 
 
-def test_gemma4_mtp_completed_head_ttft_fix_is_scoped_and_nonblocking():
+def test_gemma4_mtp_completed_head_experiment_is_removed_from_core_and_envs():
     core_source = VLLM_ENGINE_CORE_SOURCE.read_text(encoding="utf-8")
     envs_source = ASCEND_ENVS_SOURCE.read_text(encoding="utf-8")
+    removed_env = "VLLM_ASCEND_GEMMA4_MTP_" + "COMPLETED_HEAD_" + "TTFT_FIX"
 
-    assert "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX" in envs_source
-    assert "_should_deliver_completed_gemma4_mtp_batch_head" in core_source
+    assert removed_env not in envs_source
+    assert "_gemma4_mtp_completed_head_ttft_fix_enabled" not in core_source
+    assert "_should_deliver_completed_gemma4_mtp_batch_head" not in core_source
+    assert "phase=completed_head_check" not in core_source
+    assert "phase=completed_head" not in core_source
     assert "_consume_batch_queue_output" in core_source
-    assert "future.done()" in core_source
-    assert 'device_type == "npu"' in core_source
-    assert 'method == "mtp"' in core_source
-    assert 'model_type == "gemma4"' in core_source
 
 
-def test_gemma4_mtp_completed_head_ttft_fix_is_enabled_only_for_async_validation():
+def test_gemma4_mtp_completed_head_experiment_is_removed_from_validation():
     e2e_source = E2E_SOURCE.read_text(encoding="utf-8")
     benchmark_source = BENCHMARK_SCRIPT.read_text(encoding="utf-8")
+    removed_env = "VLLM_ASCEND_GEMMA4_MTP_" + "COMPLETED_HEAD_" + "TTFT_FIX"
 
-    assert "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX" in e2e_source
-    assert "if async_scheduling" in e2e_source
-    assert '"VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX=1"' in benchmark_source
-    assert '"VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX=0"' in benchmark_source
+    assert removed_env not in e2e_source
+    assert removed_env not in benchmark_source
 
 
 def test_gemma4_mtp_async_uniproc_submit_gate_is_scoped_and_default_off():
@@ -373,6 +372,6 @@ if __name__ == "__main__":
     test_gemma4_mtp_benchmark_uses_low_noise_logging_without_disabling_metrics()
     test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table()
     test_gemma4_mtp_async_profile_is_sampled_and_passed_to_async_output()
-    test_gemma4_mtp_completed_head_ttft_fix_is_scoped_and_nonblocking()
-    test_gemma4_mtp_completed_head_ttft_fix_is_enabled_only_for_async_validation()
+    test_gemma4_mtp_completed_head_experiment_is_removed_from_core_and_envs()
+    test_gemma4_mtp_completed_head_experiment_is_removed_from_validation()
     test_gemma4_mtp_async_uniproc_submit_gate_is_scoped_and_default_off()

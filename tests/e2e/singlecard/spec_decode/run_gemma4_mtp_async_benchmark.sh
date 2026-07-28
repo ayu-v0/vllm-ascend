@@ -103,11 +103,7 @@ run_mode() {
   server_env=(
     env
     "VLLM_LOGGING_LEVEL=${SERVER_LOG_LEVEL}"
-    "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX=0"
   )
-  if [[ "${mode}" == "async" ]]; then
-    server_env[2]="VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX=1"
-  fi
 
   server_args=(
     vllm serve "${MODEL}"

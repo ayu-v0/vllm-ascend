@@ -123,11 +123,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GEMMA4_MTP_ORACLE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GEMMA4_MTP_ORACLE", "0"))
     ),
-    # Enable the experimental completed-head delivery policy for Gemma4 MTP
-    # Ascend async scheduling. This remains disabled by default.
-    "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX", "0"))
-    ),
     # Submit Gemma4 MTP async UniProc worker commands through a serialized
     # command thread. This experimental path remains disabled by default.
     "VLLM_ASCEND_GEMMA4_MTP_ASYNC_UNIPROC_SUBMIT": lambda: bool(

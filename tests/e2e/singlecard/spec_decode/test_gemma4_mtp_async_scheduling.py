@@ -90,7 +90,6 @@ def gemma4_server(
     num_speculative_tokens: int = NUM_SPECULATIVE_TOKENS,
     executor_backend: str = "uni",
     oracle_debug: bool = False,
-    completed_head: bool = False,
     async_uniproc_submit: bool = False,
     async_profile: bool = False,
     enable_responses_store: bool = False,
@@ -103,9 +102,6 @@ def gemma4_server(
             "1" if oracle_debug else "0"
         ),
         "VLLM_ASCEND_GEMMA4_MTP_DEBUG": "0",
-        "VLLM_ASCEND_GEMMA4_MTP_COMPLETED_HEAD_TTFT_FIX": (
-            "1" if completed_head else "0"
-        ),
         "VLLM_ASCEND_GEMMA4_MTP_ASYNC_UNIPROC_SUBMIT": (
             "1" if async_uniproc_submit else "0"
         ),
