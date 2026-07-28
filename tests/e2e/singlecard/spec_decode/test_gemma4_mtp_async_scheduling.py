@@ -300,11 +300,32 @@ def test_greedy_target_sync_async_diagnostic_and_oracle(
     ) as async_server:
         async_result = _completion(async_server, prompt)
 
-    for expected_name, expected, actual_name, actual in (
+    async_mp_result = None
+    if num_speculative_tokens == 3:
+        with gemma4_server(
+            async_scheduling=True,
+            use_mtp=True,
+            num_speculative_tokens=num_speculative_tokens,
+            executor_backend="mp",
+            oracle_debug=True,
+        ) as async_mp_server:
+            async_mp_result = _completion(async_mp_server, prompt)
+
+    comparisons = [
         ("target-only", target, "sync-mtp", sync),
         ("target-only", target, "async-mtp", async_result),
         ("sync-mtp", sync, "async-mtp", async_result),
-    ):
+    ]
+    if async_mp_result is not None:
+        comparisons.extend(
+            [
+                ("target-only", target, "async-mp", async_mp_result),
+                ("sync-mtp", sync, "async-mp", async_mp_result),
+                ("async-mtp", async_result, "async-mp", async_mp_result),
+            ]
+        )
+
+    for expected_name, expected, actual_name, actual in comparisons:
         difference = _choice_difference(expected, actual)
         if difference is not None:
             print(
@@ -315,6 +336,8 @@ def test_greedy_target_sync_async_diagnostic_and_oracle(
 
     assert len(_choice_view(sync)[0]) == 96
     assert len(_choice_view(async_result)[0]) == 96
+    if async_mp_result is not None:
+        assert len(_choice_view(async_mp_result)[0]) == 96
 
 
 def test_greedy_async_mp_matches_sync_mtp():
