@@ -301,6 +301,7 @@ def test_greedy_target_sync_async_diagnostic_and_oracle(
         async_result = _completion(async_server, prompt)
 
     async_mp_result = None
+    async_candidate_result = None
     if num_speculative_tokens == 3:
         with gemma4_server(
             async_scheduling=True,
@@ -310,6 +311,14 @@ def test_greedy_target_sync_async_diagnostic_and_oracle(
             oracle_debug=True,
         ) as async_mp_server:
             async_mp_result = _completion(async_mp_server, prompt)
+        with gemma4_server(
+            async_scheduling=True,
+            use_mtp=True,
+            num_speculative_tokens=num_speculative_tokens,
+            oracle_debug=True,
+            async_uniproc_submit=True,
+        ) as async_candidate_server:
+            async_candidate_result = _completion(async_candidate_server, prompt)
 
     comparisons = [
         ("target-only", target, "sync-mtp", sync),
@@ -322,6 +331,15 @@ def test_greedy_target_sync_async_diagnostic_and_oracle(
                 ("target-only", target, "async-mp", async_mp_result),
                 ("sync-mtp", sync, "async-mp", async_mp_result),
                 ("async-mtp", async_result, "async-mp", async_mp_result),
+            ]
+        )
+    if async_candidate_result is not None:
+        comparisons.extend(
+            [
+                ("target-only", target, "async-candidate", async_candidate_result),
+                ("sync-mtp", sync, "async-candidate", async_candidate_result),
+                ("async-mtp", async_result, "async-candidate", async_candidate_result),
+                ("async-mp", async_mp_result, "async-candidate", async_candidate_result),
             ]
         )
 
@@ -338,6 +356,8 @@ def test_greedy_target_sync_async_diagnostic_and_oracle(
     assert len(_choice_view(async_result)[0]) == 96
     if async_mp_result is not None:
         assert len(_choice_view(async_mp_result)[0]) == 96
+    if async_candidate_result is not None:
+        assert len(_choice_view(async_candidate_result)[0]) == 96
 
 
 def test_greedy_async_mp_matches_sync_mtp():
@@ -382,14 +402,22 @@ def test_greedy_async_mp_matches_sync_mtp():
     assert len(_choice_view(async_mp)[0]) == 96
 
 
-@pytest.mark.parametrize("async_scheduling", [False, True])
-def test_greedy_boundaries_without_padding(async_scheduling: bool):
+@pytest.mark.parametrize(
+    ("async_scheduling", "async_uniproc_submit"),
+    [(False, False), (True, False), (True, True)],
+    ids=["sync", "async-baseline", "async-uniproc-candidate"],
+)
+def test_greedy_boundaries_without_padding(
+    async_scheduling: bool, async_uniproc_submit: bool
+):
     prompt = "请用三句话解释为什么幂等接口可以安全重试。"
     eos_prompt = "Reply with exactly this word: OK"
     stop_prompt = "Reply with exactly: alpha [MTP-END] beta"
     with gemma4_server(
         async_scheduling=async_scheduling,
         use_mtp=True,
+        async_uniproc_submit=async_uniproc_submit,
+        async_profile=async_uniproc_submit,
     ) as server:
         completion = _completion(server, prompt)
         max_tokens = _completion(server, prompt, max_tokens=1)
@@ -408,11 +436,16 @@ def test_greedy_boundaries_without_padding(async_scheduling: bool):
     assert "[MTP-END]" not in _choice_view(stopped)[1]
 
 
-def test_streaming_matches_non_streaming_and_cancel_releases_resources():
+@pytest.mark.parametrize("async_uniproc_submit", [False, True])
+def test_streaming_matches_non_streaming_and_cancel_releases_resources(
+    async_uniproc_submit: bool,
+):
     prompt = "写一段关于分布式系统幂等性的简短说明。"
     with gemma4_server(
         async_scheduling=True,
         use_mtp=True,
+        async_uniproc_submit=async_uniproc_submit,
+        async_profile=async_uniproc_submit,
         enable_responses_store=True,
     ) as server:
         non_streaming = _completion(server, prompt)
@@ -454,7 +487,10 @@ def test_streaming_matches_non_streaming_and_cancel_releases_resources():
         assert _choice_view(probe)[1]
 
 
-def test_mixed_prefill_decode_requests_complete_without_padding_or_reordering():
+@pytest.mark.parametrize("async_uniproc_submit", [False, True])
+def test_mixed_prefill_decode_requests_complete_without_padding_or_reordering(
+    async_uniproc_submit: bool,
+):
     long_prompt = "请逐条列出分布式事务的失败模式和恢复策略。" * 256
     requests_to_run = [
         (long_prompt, None),
@@ -464,7 +500,12 @@ def test_mixed_prefill_decode_requests_complete_without_padding_or_reordering():
         ("Respond with exactly this marker: MTP-SHORT-C", "MTP-SHORT-C"),
     ]
 
-    with gemma4_server(async_scheduling=True, use_mtp=True) as server:
+    with gemma4_server(
+        async_scheduling=True,
+        use_mtp=True,
+        async_uniproc_submit=async_uniproc_submit,
+        async_profile=async_uniproc_submit,
+    ) as server:
         with ThreadPoolExecutor(max_workers=len(requests_to_run)) as executor:
             futures = [
                 executor.submit(_completion, server, prompt)
