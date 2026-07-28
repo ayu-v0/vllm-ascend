@@ -92,6 +92,7 @@ def gemma4_server(
     oracle_debug: bool = False,
     completed_head: bool = False,
     async_uniproc_submit: bool = False,
+    async_profile: bool = False,
     enable_responses_store: bool = False,
 ) -> Iterator[RemoteOpenAIServer]:
     assert MODEL is not None
@@ -108,6 +109,7 @@ def gemma4_server(
         "VLLM_ASCEND_GEMMA4_MTP_ASYNC_UNIPROC_SUBMIT": (
             "1" if async_uniproc_submit else "0"
         ),
+        "VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE": "1" if async_profile else "0",
     }
     if enable_responses_store:
         env_dict["VLLM_ENABLE_RESPONSES_API_STORE"] = "1"
@@ -313,6 +315,48 @@ def test_greedy_target_sync_async_diagnostic_and_oracle(
 
     assert len(_choice_view(sync)[0]) == 96
     assert len(_choice_view(async_result)[0]) == 96
+
+
+def test_greedy_async_mp_matches_sync_mtp():
+    prompt = "请用三句话解释为什么幂等接口可以安全重试。"
+    with gemma4_server(
+        async_scheduling=False,
+        use_mtp=True,
+        num_speculative_tokens=3,
+    ) as sync_server:
+        sync = _completion(sync_server, prompt)
+    with gemma4_server(
+        async_scheduling=True,
+        use_mtp=True,
+        num_speculative_tokens=3,
+        executor_backend="uni",
+        async_profile=True,
+    ) as async_uni_server:
+        async_uni = _completion(async_uni_server, prompt)
+    with gemma4_server(
+        async_scheduling=True,
+        use_mtp=True,
+        num_speculative_tokens=3,
+        executor_backend="mp",
+        async_profile=True,
+    ) as async_mp_server:
+        async_mp = _completion(async_mp_server, prompt)
+
+    for expected_name, expected, actual_name, actual in (
+        ("sync-mtp", sync, "async-uni", async_uni),
+        ("sync-mtp", sync, "async-mp", async_mp),
+        ("async-uni", async_uni, "async-mp", async_mp),
+    ):
+        difference = _choice_difference(expected, actual)
+        if difference is not None:
+            print(
+                "Gemma4 PERF-02 W4A16 cross-process diagnostic: "
+                f"k=3 {expected_name}!={actual_name} {difference}"
+            )
+
+    assert len(_choice_view(sync)[0]) == 96
+    assert len(_choice_view(async_uni)[0]) == 96
+    assert len(_choice_view(async_mp)[0]) == 96
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
