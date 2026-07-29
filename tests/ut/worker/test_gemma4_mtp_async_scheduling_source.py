@@ -1,4 +1,8 @@
 import ast
+import json
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 
@@ -18,6 +22,14 @@ BENCHMARK_SCRIPT = (
     / "singlecard"
     / "spec_decode"
     / "run_gemma4_mtp_async_benchmark.sh"
+)
+SUMMARIZER_SCRIPT = (
+    Path(__file__).parents[3]
+    / "tests"
+    / "e2e"
+    / "singlecard"
+    / "spec_decode"
+    / "summarize_gemma4_mtp_async_benchmark.py"
 )
 MODEL_RUNNER_SOURCE = (
     Path(__file__).parents[3]
@@ -253,7 +265,7 @@ def helper_explicit_false():
 def test_gemma4_mtp_benchmark_keeps_k_and_workload_constant():
     source = BENCHMARK_SCRIPT.read_text(encoding="utf-8")
 
-    assert 'MODES=("sync" "async")' in source
+    assert 'MODES=("sync" "async_uni" "async_mp" "async_candidate")' in source
     assert '"--no-async-scheduling"' in source
     assert '"--async-scheduling"' in source
     assert "SPECULATIVE_CONFIG" in source
@@ -270,19 +282,127 @@ def test_gemma4_mtp_benchmark_keeps_k_and_workload_constant():
         assert value in source
 
 
+def test_gemma4_mtp_benchmark_records_executor_and_candidate_per_mode():
+    source = BENCHMARK_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'executor_backend="uni"' in source
+    assert 'executor_backend="mp"' in source
+    assert 'candidate="0"' in source
+    assert 'candidate="1"' in source
+    assert '--distributed-executor-backend' in source
+    assert '"VLLM_ASCEND_GEMMA4_MTP_ASYNC_UNIPROC_SUBMIT=${candidate}"' in source
+    assert '"HCCL_OP_EXPANSION_MODE=AIV"' in source
+    assert 'printf \'%q \' "${server_env[@]}" "${server_args[@]}"' in source
+    assert '"executor_backend=${executor_backend}"' in source
+    assert '"candidate=${candidate}"' in source
+
+
+def test_gemma4_mtp_benchmark_summarizer_aggregates_three_runs():
+    mode_config = {
+        "sync": ("uni", "0"),
+        "async_uni": ("uni", "0"),
+        "async_mp": ("mp", "0"),
+        "async_candidate": ("uni", "1"),
+    }
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        run_roots = []
+        for run_index in range(3):
+            run_root = root / f"run-{run_index + 1}"
+            run_roots.append(run_root)
+            for mode_index, (mode, (executor, candidate)) in enumerate(
+                mode_config.items()
+            ):
+                mode_dir = run_root / mode
+                mode_dir.mkdir(parents=True)
+                result = {
+                    "mode": mode,
+                    "executor_backend": executor,
+                    "candidate": candidate,
+                    "k": "3",
+                    "max_model_len": "32768",
+                    "max_num_seqs": "72",
+                    "input_len": "256",
+                    "output_len": "128",
+                    "max_concurrency": "72",
+                    "num_prompts": "3000",
+                    "request_rate": "inf",
+                    "temperature": "0",
+                    "seed": "0",
+                    "hccl_op_expansion_mode": "AIV",
+                    "completed": 3000,
+                    "failed": 0,
+                    "request_throughput": 10.0 + run_index + mode_index,
+                    "output_throughput": 100.0 + run_index + mode_index,
+                    "mean_ttft_ms": 20.0 + run_index + mode_index,
+                    "median_ttft_ms": 18.0 + run_index + mode_index,
+                    "p95_ttft_ms": 30.0 + run_index + mode_index,
+                    "mean_e2el_ms": 200.0 + run_index + mode_index,
+                    "median_e2el_ms": 190.0 + run_index + mode_index,
+                    "p95_e2el_ms": 250.0 + run_index + mode_index,
+                    "spec_decode_acceptance_rate": 80.0 + mode_index,
+                    "spec_decode_acceptance_length": 3.0 + mode_index / 10,
+                    "spec_decode_draft_tokens": 9000,
+                    "spec_decode_accepted_tokens": 7200,
+                }
+                (mode_dir / f"{mode}.json").write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+                (mode_dir / "server-command.txt").write_text(
+                    f"env backend={executor} candidate={candidate} vllm serve\n",
+                    encoding="utf-8",
+                )
+
+        output_path = root / "summary.md"
+        subprocess.run(
+            [
+                sys.executable,
+                str(SUMMARIZER_SCRIPT),
+                str(output_path),
+                *(str(run_root) for run_root in run_roots),
+            ],
+            check=True,
+        )
+        summary = output_path.read_text(encoding="utf-8")
+
+    assert "## Three-Run Median" in summary
+    assert "`async_uni`" in summary
+    assert "`async_mp`" in summary
+    assert "`async_candidate`" in summary
+    assert "## Server Commands" in summary
+    assert "backend=mp candidate=0" in summary
+
+
 def test_gemma4_mtp_benchmark_defaults_support_the_target_load():
     source = BENCHMARK_SCRIPT.read_text(encoding="utf-8")
 
     assert 'MAX_NUM_SEQS=${VLLM_ASCEND_GEMMA4_MTP_BENCH_MAX_NUM_SEQS:-72}' in source
     assert 'NUM_PROMPTS=${VLLM_ASCEND_GEMMA4_MTP_BENCH_NUM_PROMPTS:-3000}' in source
     assert 'MAX_CONCURRENCY=${VLLM_ASCEND_GEMMA4_MTP_BENCH_MAX_CONCURRENCY:-72}' in source
+    for name, value in (
+        ("NUM_SPECULATIVE_TOKENS", "3"),
+        ("MAX_MODEL_LEN", "32768"),
+        ("MAX_NUM_SEQS", "72"),
+        ("NUM_PROMPTS", "3000"),
+        ("INPUT_LEN", "256"),
+        ("OUTPUT_LEN", "128"),
+        ("MAX_CONCURRENCY", "72"),
+        ("REQUEST_RATE", "inf"),
+        ("BENCHMARK_SEED", "0"),
+    ):
+        assert f'require_fixed_value "{name}" "${{{name}}}" "{value}"' in source
 
 
 def test_gemma4_mtp_benchmark_uses_low_noise_logging_without_disabling_metrics():
     source = BENCHMARK_SCRIPT.read_text(encoding="utf-8")
 
     assert 'SERVER_LOG_LEVEL=${VLLM_ASCEND_GEMMA4_MTP_BENCH_LOG_LEVEL:-WARNING}' in source
+    assert 'VLLM_ASCEND_GEMMA4_MTP_ORACLE' in source
     assert 'VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE' in source
+    assert '"VLLM_BATCH_INVARIANT=0"' in source
+    assert '"VLLM_ASCEND_GEMMA4_MTP_ORACLE=0"' in source
+    assert '"VLLM_ASCEND_GEMMA4_MTP_DEBUG=0"' in source
+    assert '"VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE=0"' in source
     assert '"${server_env[@]}" "${server_args[@]}"' in source
     assert '--disable-tqdm' in source
     assert '--disable-log-stats' not in source
@@ -363,11 +483,14 @@ def test_gemma4_mtp_async_uniproc_submit_gate_is_scoped_and_default_off():
 
 if __name__ == "__main__":
     test_gemma4_mtp_keeps_requested_async_scheduling_on_ascend()
+    test_gemma4_mtp_oracle_has_a_dedicated_default_off_switch()
     test_gemma4_mtp_e2e_starts_explicit_sync_and_async_servers()
     test_gemma4_mtp_e2e_validates_cancelled_request_resource_release()
     test_gemma4_mtp_oracle_debug_is_scoped_to_correctness_gate()
     test_oracle_debug_owner_scan_covers_sync_async_helpers_and_ignores_false()
     test_gemma4_mtp_benchmark_keeps_k_and_workload_constant()
+    test_gemma4_mtp_benchmark_records_executor_and_candidate_per_mode()
+    test_gemma4_mtp_benchmark_summarizer_aggregates_three_runs()
     test_gemma4_mtp_benchmark_defaults_support_the_target_load()
     test_gemma4_mtp_benchmark_uses_low_noise_logging_without_disabling_metrics()
     test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table()

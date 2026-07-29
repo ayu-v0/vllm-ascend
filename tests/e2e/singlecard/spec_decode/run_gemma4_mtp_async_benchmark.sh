@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compare Gemma4 MTP sync and async scheduling with an identical workload.
+# Compare Gemma4 MTP scheduling/executor candidates with an identical workload.
 
 set -euo pipefail
 
@@ -14,8 +14,16 @@ if [[ -n "${VLLM_ASCEND_GEMMA4_MTP_DEBUG:-}" ]]; then
   echo "Unset VLLM_ASCEND_GEMMA4_MTP_DEBUG before benchmarking." >&2
   exit 2
 fi
+if [[ "${VLLM_ASCEND_GEMMA4_MTP_ORACLE:-0}" != "0" ]]; then
+  echo "Unset VLLM_ASCEND_GEMMA4_MTP_ORACLE before benchmarking." >&2
+  exit 2
+fi
 if [[ "${VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE:-0}" != "0" ]]; then
   echo "Unset VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE before benchmarking." >&2
+  exit 2
+fi
+if [[ "${HCCL_OP_EXPANSION_MODE:-AIV}" != "AIV" ]]; then
+  echo "HCCL_OP_EXPANSION_MODE must be AIV for the fixed benchmark." >&2
   exit 2
 fi
 
@@ -38,7 +46,27 @@ NUM_WARMUPS=${VLLM_ASCEND_GEMMA4_MTP_BENCH_NUM_WARMUPS:-8}
 REQUEST_RATE=${VLLM_ASCEND_GEMMA4_MTP_BENCH_REQUEST_RATE:-inf}
 BENCHMARK_SEED=${VLLM_ASCEND_GEMMA4_MTP_BENCH_SEED:-0}
 RESULT_ROOT=${VLLM_ASCEND_GEMMA4_MTP_BENCH_RESULT_ROOT:-"$(pwd)/gemma4_mtp_async_benchmark_$(date +%Y%m%d_%H%M%S)"}
-MODES=("sync" "async")
+MODES=("sync" "async_uni" "async_mp" "async_candidate")
+
+require_fixed_value() {
+  local name=$1
+  local actual=$2
+  local expected=$3
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "${name} must be ${expected} for BENCH-01; got ${actual}." >&2
+    exit 2
+  fi
+}
+
+require_fixed_value "NUM_SPECULATIVE_TOKENS" "${NUM_SPECULATIVE_TOKENS}" "3"
+require_fixed_value "MAX_MODEL_LEN" "${MAX_MODEL_LEN}" "32768"
+require_fixed_value "MAX_NUM_SEQS" "${MAX_NUM_SEQS}" "72"
+require_fixed_value "NUM_PROMPTS" "${NUM_PROMPTS}" "3000"
+require_fixed_value "INPUT_LEN" "${INPUT_LEN}" "256"
+require_fixed_value "OUTPUT_LEN" "${OUTPUT_LEN}" "128"
+require_fixed_value "MAX_CONCURRENCY" "${MAX_CONCURRENCY}" "72"
+require_fixed_value "REQUEST_RATE" "${REQUEST_RATE}" "inf"
+require_fixed_value "BENCHMARK_SEED" "${BENCHMARK_SEED}" "0"
 
 SPECULATIVE_CONFIG='{"method":"mtp","model":"'${DRAFT_MODEL}'","num_speculative_tokens": '${NUM_SPECULATIVE_TOKENS}'}'
 SERVER_PID=""
@@ -90,19 +118,48 @@ run_mode() {
   local log_file="${mode_dir}/server.log"
   local result_file="${mode}.json"
   local scheduling_arg
+  local executor_backend
+  local candidate
   local -a server_args
   local -a server_env
 
   mkdir -p "${mode_dir}"
-  if [[ "${mode}" == "sync" ]]; then
-    scheduling_arg="--no-async-scheduling"
-  else
-    scheduling_arg="--async-scheduling"
-  fi
+  case "${mode}" in
+    sync)
+      scheduling_arg="--no-async-scheduling"
+      executor_backend="uni"
+      candidate="0"
+      ;;
+    async_uni)
+      scheduling_arg="--async-scheduling"
+      executor_backend="uni"
+      candidate="0"
+      ;;
+    async_mp)
+      scheduling_arg="--async-scheduling"
+      executor_backend="mp"
+      candidate="0"
+      ;;
+    async_candidate)
+      scheduling_arg="--async-scheduling"
+      executor_backend="uni"
+      candidate="1"
+      ;;
+    *)
+      echo "Unknown benchmark mode: ${mode}" >&2
+      exit 2
+      ;;
+  esac
 
   server_env=(
     env
+    "HCCL_OP_EXPANSION_MODE=AIV"
     "VLLM_LOGGING_LEVEL=${SERVER_LOG_LEVEL}"
+    "VLLM_BATCH_INVARIANT=0"
+    "VLLM_ASCEND_GEMMA4_MTP_ORACLE=0"
+    "VLLM_ASCEND_GEMMA4_MTP_DEBUG=0"
+    "VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE=0"
+    "VLLM_ASCEND_GEMMA4_MTP_ASYNC_UNIPROC_SUBMIT=${candidate}"
   )
 
   server_args=(
@@ -114,6 +171,7 @@ run_mode() {
     --max-num-batched-tokens "${MAX_BATCHED_TOKENS}"
     --kv-cache-dtype auto
     --tensor-parallel-size 1
+    --distributed-executor-backend "${executor_backend}"
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
     --optimization-level 3
     --trust-remote-code
@@ -127,7 +185,7 @@ run_mode() {
     "${scheduling_arg}"
   )
 
-  printf '%q ' "${server_args[@]}" >"${mode_dir}/server-command.txt"
+  printf '%q ' "${server_env[@]}" "${server_args[@]}" >"${mode_dir}/server-command.txt"
   printf '\n' >>"${mode_dir}/server-command.txt"
   "${server_env[@]}" "${server_args[@]}" >"${log_file}" 2>&1 &
   SERVER_PID=$!
@@ -157,10 +215,13 @@ run_mode() {
     --save-detailed \
     --result-dir "${mode_dir}" \
     --result-filename "${result_file}" \
-    --metadata "mode=${mode}" "k=${NUM_SPECULATIVE_TOKENS}" \
+    --metadata "mode=${mode}" "executor_backend=${executor_backend}" \
+      "candidate=${candidate}" "k=${NUM_SPECULATIVE_TOKENS}" \
       "max_model_len=${MAX_MODEL_LEN}" "input_len=${INPUT_LEN}" \
       "output_len=${OUTPUT_LEN}" "max_concurrency=${MAX_CONCURRENCY}" \
-      "num_prompts=${NUM_PROMPTS}" "seed=${BENCHMARK_SEED}" \
+      "max_num_seqs=${MAX_NUM_SEQS}" "num_prompts=${NUM_PROMPTS}" \
+      "request_rate=${REQUEST_RATE}" "temperature=0" \
+      "seed=${BENCHMARK_SEED}" "hccl_op_expansion_mode=AIV" \
     | tee "${mode_dir}/client.log"
 
   curl --fail --silent --show-error "http://127.0.0.1:${BENCHMARK_PORT}/metrics" \
@@ -175,9 +236,10 @@ if curl --fail --silent "http://127.0.0.1:${BENCHMARK_PORT}/health" >/dev/null; 
   exit 2
 fi
 
-printf 'model=%s\ndraft_model=%s\nk=%s\nmax_model_len=%s\nnum_prompts=%s\ninput_len=%s\noutput_len=%s\nmax_concurrency=%s\nrequest_rate=%s\nseed=%s\n' \
-  "${MODEL}" "${DRAFT_MODEL}" "${NUM_SPECULATIVE_TOKENS}" "${MAX_MODEL_LEN}" \
-  "${NUM_PROMPTS}" "${INPUT_LEN}" "${OUTPUT_LEN}" "${MAX_CONCURRENCY}" \
+printf 'model=%s\ndraft_model=%s\nmodes=%s\nk=%s\nmax_model_len=%s\nmax_num_seqs=%s\nnum_prompts=%s\ninput_len=%s\noutput_len=%s\nmax_concurrency=%s\nrequest_rate=%s\ntemperature=0\nseed=%s\nhccl_op_expansion_mode=AIV\n' \
+  "${MODEL}" "${DRAFT_MODEL}" "${MODES[*]}" "${NUM_SPECULATIVE_TOKENS}" \
+  "${MAX_MODEL_LEN}" "${MAX_NUM_SEQS}" "${NUM_PROMPTS}" "${INPUT_LEN}" \
+  "${OUTPUT_LEN}" "${MAX_CONCURRENCY}" \
   "${REQUEST_RATE}" "${BENCHMARK_SEED}" >"${RESULT_ROOT}/manifest.txt"
 
 for mode in "${MODES[@]}"; do
@@ -185,7 +247,6 @@ for mode in "${MODES[@]}"; do
 done
 
 python3 "${SCRIPT_DIR}/summarize_gemma4_mtp_async_benchmark.py" \
-  "${RESULT_ROOT}/sync/sync.json" "${RESULT_ROOT}/async/async.json" \
-  "${RESULT_ROOT}/summary.md"
+  "${RESULT_ROOT}/summary.md" "${RESULT_ROOT}"
 
 echo "Benchmark artifacts: ${RESULT_ROOT}"
