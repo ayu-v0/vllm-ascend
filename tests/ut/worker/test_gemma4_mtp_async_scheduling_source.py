@@ -31,6 +31,22 @@ SUMMARIZER_SCRIPT = (
     / "spec_decode"
     / "summarize_gemma4_mtp_async_benchmark.py"
 )
+AB_BENCHMARK_SCRIPT = (
+    Path(__file__).parents[3]
+    / "tests"
+    / "e2e"
+    / "singlecard"
+    / "spec_decode"
+    / "run_gemma4_mtp_ab_benchmark.sh"
+)
+AB_SUMMARIZER_SCRIPT = (
+    Path(__file__).parents[3]
+    / "tests"
+    / "e2e"
+    / "singlecard"
+    / "spec_decode"
+    / "summarize_gemma4_mtp_ab_benchmark.py"
+)
 MODEL_RUNNER_SOURCE = (
     Path(__file__).parents[3]
     / "vllm_ascend"
@@ -409,6 +425,142 @@ def test_gemma4_mtp_benchmark_uses_low_noise_logging_without_disabling_metrics()
     assert '--enable-log-requests' not in source
 
 
+def test_gemma4_mtp_ab_benchmark_defines_three_single_card_modes():
+    assert AB_BENCHMARK_SCRIPT.is_file()
+    source = AB_BENCHMARK_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'MODES=("no_mtp_uni" "mtp_uni" "mtp_mp")' in source
+    assert '"ASCEND_RT_VISIBLE_DEVICES=0"' in source
+    assert '--tensor-parallel-size 1' in source
+    assert '--async-scheduling' in source
+    assert 'MAX_NUM_SEQS=${VLLM_ASCEND_GEMMA4_MTP_AB_MAX_NUM_SEQS:-16}' in source
+    assert 'NUM_PROMPTS=${VLLM_ASCEND_GEMMA4_MTP_AB_NUM_PROMPTS:-500}' in source
+    assert 'MAX_CONCURRENCY=${VLLM_ASCEND_GEMMA4_MTP_AB_MAX_CONCURRENCY:-16}' in source
+    assert 'INPUT_LEN=${VLLM_ASCEND_GEMMA4_MTP_AB_INPUT_LEN:-12500}' in source
+    assert 'OUTPUT_LEN=${VLLM_ASCEND_GEMMA4_MTP_AB_OUTPUT_LEN:-1024}' in source
+    assert 'RANGE_RATIO=\'{"input":0.2,"output":0.0}\'' in source
+    assert '--random-range-ratio "${RANGE_RATIO}"' in source
+    assert 'no_mtp_uni)\n      executor_backend="uni"\n      use_mtp="0"' in source
+    assert 'mtp_uni)\n      executor_backend="uni"\n      use_mtp="1"' in source
+    assert 'mtp_mp)\n      executor_backend="mp"\n      use_mtp="1"' in source
+    assert 'if [[ "${use_mtp}" == "1" ]]; then' in source
+    assert '--distributed-executor-backend "${executor_backend}"' in source
+    assert '--speculative-config' in source
+    assert 'run_round 1 no_mtp_uni mtp_uni mtp_mp' in source
+    assert 'run_round 2 mtp_mp mtp_uni no_mtp_uni' in source
+    assert 'run_round 3 no_mtp_uni mtp_mp mtp_uni' in source
+
+
+def test_gemma4_mtp_ab_summarizer_aggregates_three_modes():
+    assert AB_SUMMARIZER_SCRIPT.is_file()
+    mode_config = {
+        "no_mtp_uni": ("uni", "0", "0"),
+        "mtp_uni": ("uni", "1", "3"),
+        "mtp_mp": ("mp", "1", "3"),
+    }
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        run_roots = []
+        for run_index in range(3):
+            run_root = root / f"round_{run_index + 1}"
+            run_roots.append(run_root)
+            for mode_index, (mode, (executor, use_mtp, k)) in enumerate(
+                mode_config.items()
+            ):
+                mode_dir = run_root / mode
+                mode_dir.mkdir(parents=True)
+                throughput_multiplier = (1.0, 1.08, 1.10)[mode_index]
+                latency_multiplier = (1.0, 0.90, 0.88)[mode_index]
+                result = {
+                    "round": str(run_index + 1),
+                    "mode": mode,
+                    "executor_backend": executor,
+                    "use_mtp": use_mtp,
+                    "k": k,
+                    "device": "0",
+                    "tensor_parallel_size": "1",
+                    "max_model_len": "32768",
+                    "max_num_seqs": "16",
+                    "max_batched_tokens": "16384",
+                    "input_len": "12500",
+                    "input_min": "10000",
+                    "input_max": "15000",
+                    "output_len": "1024",
+                    "max_concurrency": "16",
+                    "num_prompts": "500",
+                    "request_rate": "inf",
+                    "temperature": "0",
+                    "seed": "0",
+                    "completed": 500,
+                    "failed": 0,
+                    "input_lens": [10000 + i * 10 for i in range(500)],
+                    "output_lens": [1024] * 500,
+                    "request_throughput": (1.0 + run_index / 100)
+                    * throughput_multiplier,
+                    "output_throughput": (100.0 + run_index)
+                    * throughput_multiplier,
+                    "mean_ttft_ms": (1000.0 + run_index) * latency_multiplier,
+                    "median_ttft_ms": (900.0 + run_index) * latency_multiplier,
+                    "p95_ttft_ms": (1200.0 + run_index) * latency_multiplier,
+                    "mean_tpot_ms": (10.0 + run_index / 100) * latency_multiplier,
+                    "median_tpot_ms": (9.0 + run_index / 100) * latency_multiplier,
+                    "p95_tpot_ms": (12.0 + run_index / 100) * latency_multiplier,
+                    "mean_itl_ms": (10.5 + run_index / 100) * latency_multiplier,
+                    "median_itl_ms": (9.5 + run_index / 100) * latency_multiplier,
+                    "p95_itl_ms": (12.5 + run_index / 100) * latency_multiplier,
+                    "mean_e2el_ms": (12000.0 + run_index) * latency_multiplier,
+                    "median_e2el_ms": (11000.0 + run_index) * latency_multiplier,
+                    "p95_e2el_ms": (15000.0 + run_index) * latency_multiplier,
+                }
+                if use_mtp == "1":
+                    result.update(
+                        {
+                            "spec_decode_acceptance_rate": 20.0 + mode_index,
+                            "spec_decode_acceptance_length": 1.6 + mode_index / 10,
+                            "spec_decode_num_drafts": 100000,
+                            "spec_decode_draft_tokens": 300000,
+                            "spec_decode_accepted_tokens": 60000,
+                        }
+                    )
+                (mode_dir / f"{mode}.json").write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+                command = (
+                    f"env ASCEND_RT_VISIBLE_DEVICES=0 backend={executor} "
+                    "vllm serve --tensor-parallel-size 1 "
+                    f"--distributed-executor-backend {executor} "
+                    "--async-scheduling"
+                )
+                if use_mtp == "1":
+                    command += " --speculative-config mtp-config"
+                (mode_dir / "server-command.txt").write_text(
+                    command + "\n", encoding="utf-8"
+                )
+
+        output_path = root / "summary.md"
+        subprocess.run(
+            [
+                sys.executable,
+                str(AB_SUMMARIZER_SCRIPT),
+                str(output_path),
+                *(str(run_root) for run_root in run_roots),
+            ],
+            check=True,
+        )
+        summary = output_path.read_text(encoding="utf-8")
+
+    assert "## Three-Run Median" in summary
+    assert "`no_mtp_uni`" in summary
+    assert "`mtp_uni`" in summary
+    assert "`mtp_mp`" in summary
+    assert "## MTP vs No-MTP" in summary
+    assert "## MTP MP vs Uni" in summary
+    assert "## Decisions" in summary
+    assert "`mtp_uni`: clear improvement" in summary
+    assert "`mtp_mp`: clear improvement" in summary
+    assert "## Server Commands" in summary
+
+
 def test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table():
     runner_source = MODEL_RUNNER_SOURCE.read_text(encoding="utf-8")
     proposer_source = ASCEND_GEMMA4_PROPOSER_SOURCE.read_text(encoding="utf-8")
@@ -493,6 +645,8 @@ if __name__ == "__main__":
     test_gemma4_mtp_benchmark_summarizer_aggregates_three_runs()
     test_gemma4_mtp_benchmark_defaults_support_the_target_load()
     test_gemma4_mtp_benchmark_uses_low_noise_logging_without_disabling_metrics()
+    test_gemma4_mtp_ab_benchmark_defines_three_single_card_modes()
+    test_gemma4_mtp_ab_summarizer_aggregates_three_modes()
     test_gemma4_mtp_per_group_metadata_keeps_slot_mapping_with_block_table()
     test_gemma4_mtp_async_profile_is_sampled_and_passed_to_async_output()
     test_gemma4_mtp_completed_head_experiment_is_removed_from_core_and_envs()
