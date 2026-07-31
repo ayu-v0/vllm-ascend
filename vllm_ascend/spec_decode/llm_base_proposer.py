@@ -1378,7 +1378,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         hidden_states = hidden_states[token_indices_to_sample]
         token_indices_to_sample = self.arange[:batch_size]
 
-        input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+        # Gemma4 MTP runs eagerly on Ascend. Its first forward consumes all
+        # scheduled tokens, while each follow-up step only processes one token
+        # for every request that produced a proposal.
+        if use_gemma4_mtp and not self.use_cuda_graph:
+            input_batch_size = batch_size
+        elif self.method == "mtp" or self.use_cuda_graph:
+            input_batch_size = num_input_tokens
+        else:
+            input_batch_size = batch_size
 
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size

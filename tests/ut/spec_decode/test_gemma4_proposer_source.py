@@ -148,6 +148,22 @@ def test_gemma4_mtp_merged_draft_keeps_model_positions_constant():
     assert constant_position_guard < position_increment
 
 
+def test_gemma4_mtp_eager_followup_uses_real_batch_size():
+    source = _method_source_from(BASE_SOURCE, "_run_merged_draft")
+    gemma4_guard = "if use_gemma4_mtp and not self.use_cuda_graph:"
+    generic_mtp_guard = 'elif self.method == "mtp" or self.use_cuda_graph:'
+
+    assert gemma4_guard in source
+    assert generic_mtp_guard in source
+    assert source.index(gemma4_guard) < source.index(generic_mtp_guard)
+
+    gemma4_branch = source.split(gemma4_guard, 1)[1].split(
+        generic_mtp_guard,
+        1,
+    )[0]
+    assert "input_batch_size = batch_size" in gemma4_branch
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
     test_ascend_gemma4_uses_sparse_top_tokens_without_cuda_graphs()
@@ -161,3 +177,4 @@ if __name__ == "__main__":
     test_gemma4_mtp_constant_metadata_does_not_mutate_position_input()
     test_gemma4_mtp_reinitializes_metadata_shape_for_every_draft_step()
     test_gemma4_mtp_merged_draft_keeps_model_positions_constant()
+    test_gemma4_mtp_eager_followup_uses_real_batch_size()

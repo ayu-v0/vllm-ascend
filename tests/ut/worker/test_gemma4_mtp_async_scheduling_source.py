@@ -433,9 +433,9 @@ def test_gemma4_mtp_ab_benchmark_defines_three_single_card_modes():
     assert '"ASCEND_RT_VISIBLE_DEVICES=0"' in source
     assert '--tensor-parallel-size 1' in source
     assert '--async-scheduling' in source
-    assert 'MAX_NUM_SEQS=${VLLM_ASCEND_GEMMA4_MTP_AB_MAX_NUM_SEQS:-16}' in source
-    assert 'NUM_PROMPTS=${VLLM_ASCEND_GEMMA4_MTP_AB_NUM_PROMPTS:-500}' in source
-    assert 'MAX_CONCURRENCY=${VLLM_ASCEND_GEMMA4_MTP_AB_MAX_CONCURRENCY:-16}' in source
+    assert 'MAX_NUM_SEQS=${VLLM_ASCEND_GEMMA4_MTP_AB_MAX_NUM_SEQS:-24}' in source
+    assert 'NUM_PROMPTS=${VLLM_ASCEND_GEMMA4_MTP_AB_NUM_PROMPTS:-200}' in source
+    assert 'MAX_CONCURRENCY=${VLLM_ASCEND_GEMMA4_MTP_AB_MAX_CONCURRENCY:-24}' in source
     assert 'INPUT_LEN=${VLLM_ASCEND_GEMMA4_MTP_AB_INPUT_LEN:-12500}' in source
     assert 'OUTPUT_LEN=${VLLM_ASCEND_GEMMA4_MTP_AB_OUTPUT_LEN:-1024}' in source
     assert 'RANGE_RATIO=\'{"input":0.2,"output":0.0}\'' in source
@@ -480,21 +480,21 @@ def test_gemma4_mtp_ab_summarizer_aggregates_three_modes():
                     "device": "0",
                     "tensor_parallel_size": "1",
                     "max_model_len": "32768",
-                    "max_num_seqs": "16",
+                    "max_num_seqs": "24",
                     "max_batched_tokens": "16384",
                     "input_len": "12500",
                     "input_min": "10000",
                     "input_max": "15000",
                     "output_len": "1024",
-                    "max_concurrency": "16",
-                    "num_prompts": "500",
+                    "max_concurrency": "24",
+                    "num_prompts": "200",
                     "request_rate": "inf",
                     "temperature": "0",
                     "seed": "0",
-                    "completed": 500,
+                    "completed": 200,
                     "failed": 0,
-                    "input_lens": [10000 + i * 10 for i in range(500)],
-                    "output_lens": [1024] * 500,
+                    "input_lens": [10000 + i * 25 for i in range(200)],
+                    "output_lens": [1024] * 200,
                     "request_throughput": (1.0 + run_index / 100)
                     * throughput_multiplier,
                     "output_throughput": (100.0 + run_index)

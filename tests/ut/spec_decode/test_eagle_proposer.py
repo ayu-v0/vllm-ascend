@@ -2509,6 +2509,148 @@ class TestRunMergedDraft(TestBase):
     def get_param_names(self, sig):
         return [p.name for p in sig.parameters.values()]
 
+    def _run_mtp_eager_case(
+        self,
+        *,
+        num_input_tokens: int,
+        batch_size: int,
+        token_indices_to_sample: list[int],
+        use_gemma4_mtp: bool,
+        is_prefill: bool,
+    ):
+        self.proposer.method = "mtp"
+        self.proposer.use_cuda_graph = False
+        self.proposer.constant_draft_positions = True
+        self.proposer.pass_hidden_states_to_model = True
+        self.proposer.model_returns_tuple = MagicMock(return_value=True)
+        self.proposer.model = MockDraftModel(returns_tuple=True)
+
+        def compute_batch_logits(sample_hidden_states):
+            sample_hidden_states = sample_hidden_states[:batch_size]
+            token_ids = sample_hidden_states[:, 0].to(torch.long)
+            logits = torch.full(
+                (batch_size, self.proposer.model.vocab_size),
+                -1000.0,
+            )
+            logits[torch.arange(batch_size), token_ids] = 1000.0
+            return logits
+
+        self.proposer.model.compute_logits = compute_batch_logits
+        self.proposer._greedy_sample = MagicMock(
+            side_effect=lambda hidden_states: hidden_states[:batch_size, 0].to(
+                torch.long
+            )
+        )
+
+        self.proposer.input_ids[:num_input_tokens] = torch.arange(
+            100,
+            100 + num_input_tokens,
+            dtype=torch.int32,
+        )
+        self.proposer.positions[:num_input_tokens] = torch.arange(
+            num_input_tokens,
+            dtype=torch.int64,
+        )
+        self.proposer.hidden_states[:num_input_tokens] = torch.arange(
+            num_input_tokens * 4,
+            dtype=torch.float32,
+        ).view(num_input_tokens, 4)
+
+        sample_indices = torch.tensor(
+            token_indices_to_sample,
+            dtype=torch.int64,
+        )
+        forward_context = MagicMock()
+        forward_context.moe_layer_index = 7
+        forward_context.attn_metadata = None
+        multi_steps_attn_metadata = [
+            MagicMock() for _ in range(self.proposer.num_speculative_tokens)
+        ]
+        mock_ascend_config = MagicMock()
+        mock_ascend_config.enable_reduce_sample = False
+
+        with (
+            patch.object(
+                llm_base_proposer,
+                "_use_gemma4_mtp",
+                return_value=use_gemma4_mtp,
+            ),
+            patch.object(llm_base_proposer, "lmhead_tp_enable", return_value=False),
+            patch.object(
+                llm_base_proposer,
+                "get_ascend_config",
+                return_value=mock_ascend_config,
+            ),
+            patch.object(
+                llm_base_proposer,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+        ):
+            draft_token_ids = self.proposer._run_merged_draft(
+                num_input_tokens=num_input_tokens,
+                batch_size=batch_size,
+                token_indices_to_sample=sample_indices,
+                target_positions=self.proposer.positions[:num_input_tokens],
+                inputs_embeds=None,
+                multi_steps_attn_metadata=multi_steps_attn_metadata,
+                num_tokens=num_input_tokens,
+                is_prefill=is_prefill,
+            )
+
+        return draft_token_ids, self.proposer.model
+
+    def test_run_merged_draft_gemma4_mtp_eager_shrinks_followup_batch(self):
+        draft_token_ids, model = self._run_mtp_eager_case(
+            num_input_tokens=12,
+            batch_size=3,
+            token_indices_to_sample=[3, 7, 11],
+            use_gemma4_mtp=True,
+            is_prefill=False,
+        )
+
+        self.assertEqual(draft_token_ids.shape, (3, 3))
+        self.assertEqual(
+            [call["input_ids"].shape[0] for call in model.calls],
+            [12, 3, 3],
+        )
+        self.assertEqual(llm_base_proposer._EXTRA_CTX.num_tokens, 3)
+        self.assertEqual(llm_base_proposer._EXTRA_CTX.num_accept_tokens, 3)
+
+    def test_run_merged_draft_gemma4_mtp_eager_prefill_shrinks_followup_batch(self):
+        draft_token_ids, model = self._run_mtp_eager_case(
+            num_input_tokens=27,
+            batch_size=1,
+            token_indices_to_sample=[26],
+            use_gemma4_mtp=True,
+            is_prefill=True,
+        )
+
+        self.assertEqual(draft_token_ids.shape, (1, 3))
+        self.assertEqual(
+            [call["input_ids"].shape[0] for call in model.calls],
+            [27, 1, 1],
+        )
+        self.assertEqual(llm_base_proposer._EXTRA_CTX.num_tokens, 1)
+        self.assertEqual(llm_base_proposer._EXTRA_CTX.num_accept_tokens, 1)
+
+    def test_run_merged_draft_generic_mtp_eager_keeps_padded_followup_batch(self):
+        draft_token_ids, model = self._run_mtp_eager_case(
+            num_input_tokens=12,
+            batch_size=3,
+            token_indices_to_sample=[3, 7, 11],
+            use_gemma4_mtp=False,
+            is_prefill=False,
+        )
+
+        self.assertEqual(draft_token_ids.shape, (3, 3))
+        self.assertEqual(
+            [call["input_ids"].shape[0] for call in model.calls],
+            [12, 12, 12],
+        )
+        self.assertEqual(llm_base_proposer._EXTRA_CTX.num_tokens, 12)
+        self.assertEqual(llm_base_proposer._EXTRA_CTX.num_accept_tokens, 3)
+
     def test_run_merged_draft_eagle3_decode_prepares_each_forward_input(self):
         self.proposer.model = MockDraftModel(returns_tuple=True)
 
@@ -2681,6 +2823,10 @@ class TestRunMergedDraft(TestBase):
             )
 
         model = self.proposer.model
+        self.assertEqual(
+            [call["input_ids"].shape[0] for call in model.calls],
+            [6, 6, 6],
+        )
         self.assertEqual(draft_token_ids.tolist(), [[14, 15, 17], [271, 272, 274]])
         self.assertTrue(all(logit_input.shape[0] == 6 for logit_input in model.logit_inputs))
 

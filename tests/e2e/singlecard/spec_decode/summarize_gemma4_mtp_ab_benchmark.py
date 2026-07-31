@@ -18,14 +18,14 @@ EXPECTED_FIXED_METADATA = {
     "device": "0",
     "tensor_parallel_size": "1",
     "max_model_len": "32768",
-    "max_num_seqs": "16",
+    "max_num_seqs": "24",
     "max_batched_tokens": "16384",
     "input_len": "12500",
     "input_min": "10000",
     "input_max": "15000",
     "output_len": "1024",
-    "max_concurrency": "16",
-    "num_prompts": "500",
+    "max_concurrency": "24",
+    "num_prompts": "200",
     "request_rate": "inf",
     "temperature": "0",
     "seed": "0",
@@ -113,19 +113,19 @@ def _validate_result(path: Path, run_index: int, mode: str, result: dict) -> Non
         raise SystemExit(
             f"{path} is missing required metrics: {', '.join(missing_metrics)}"
         )
-    if int(result.get("completed", -1)) != 500:
-        raise SystemExit(f"{path} did not complete all 500 requests")
+    if int(result.get("completed", -1)) != 200:
+        raise SystemExit(f"{path} did not complete all 200 requests")
     if int(result.get("failed", -1)) != 0:
         raise SystemExit(f"{path} reported failed requests")
 
     input_lens = result.get("input_lens")
     output_lens = result.get("output_lens")
-    if not isinstance(input_lens, list) or len(input_lens) != 500:
-        raise SystemExit(f"{path} does not contain 500 detailed input lengths")
+    if not isinstance(input_lens, list) or len(input_lens) != 200:
+        raise SystemExit(f"{path} does not contain 200 detailed input lengths")
     if any(not 10000 <= int(length) <= 15000 for length in input_lens):
         raise SystemExit(f"{path} contains input lengths outside 10000-15000")
-    if not isinstance(output_lens, list) or len(output_lens) != 500:
-        raise SystemExit(f"{path} does not contain 500 detailed output lengths")
+    if not isinstance(output_lens, list) or len(output_lens) != 200:
+        raise SystemExit(f"{path} does not contain 200 detailed output lengths")
     if any(int(length) != 1024 for length in output_lens):
         raise SystemExit(f"{path} contains outputs that are not 1024 tokens")
 
