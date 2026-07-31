@@ -2781,6 +2781,7 @@ class TestRunMergedDraft(TestBase):
         self.proposer.method = "mtp"
         self.proposer.uses_mrope = True
         self.proposer.use_cuda_graph = True
+        self.assertFalse(self.proposer.constant_draft_positions)
         self.proposer.vllm_config.model_config.max_model_len = 4
         self.proposer.vllm_config.scheduler_config.max_num_seqs = 3
         self.proposer.runner.uniform_decode_query_len = 2

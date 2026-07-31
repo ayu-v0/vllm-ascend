@@ -164,6 +164,26 @@ def test_gemma4_mtp_eager_followup_uses_real_batch_size():
     assert "input_batch_size = batch_size" in gemma4_branch
 
 
+def test_ascend_base_defaults_to_advancing_draft_positions():
+    text = BASE_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    base_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "AscendSpecDecodeBaseProposer"
+    )
+    init_method = next(
+        node
+        for node in base_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    lines = text.splitlines()
+    init_source = "\n".join(lines[init_method.lineno - 1 : init_method.end_lineno])
+
+    assert "self.constant_draft_positions = False" in init_source
+
+
 if __name__ == "__main__":
     test_gemma4_mtp_disables_drafter_full_aclgraph()
     test_ascend_gemma4_uses_sparse_top_tokens_without_cuda_graphs()
@@ -178,3 +198,4 @@ if __name__ == "__main__":
     test_gemma4_mtp_reinitializes_metadata_shape_for_every_draft_step()
     test_gemma4_mtp_merged_draft_keeps_model_positions_constant()
     test_gemma4_mtp_eager_followup_uses_real_batch_size()
+    test_ascend_base_defaults_to_advancing_draft_positions()

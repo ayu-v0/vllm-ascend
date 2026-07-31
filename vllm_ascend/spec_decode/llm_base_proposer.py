@@ -225,6 +225,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.use_async_scheduling = self.vllm_config.scheduler_config.async_scheduling
         self.use_compress = hasattr(self.vllm_config.model_config.hf_config, "compress_ratios")
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
+        self.constant_draft_positions = False
         self.decode_threshold = 1 + self.num_speculative_tokens
         self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
         self.arange_cpu = torch.arange(self.arange.shape[0], device="cpu", dtype=torch.int32)
