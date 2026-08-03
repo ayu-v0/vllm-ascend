@@ -117,12 +117,12 @@ def test_run_merged_draft_initializes_gemma4_mtp_flag_before_use():
 
 def test_gemma4_mtp_uses_constant_position_multistep_metadata_helper():
     base_propose = _method_source_from(BASE_SOURCE, "_propose")
-    gemma_helper = _method_source("build_constant_position_multi_step_metadata")
+    step_builder = _method_source("_build_constant_position_step_metadata")
 
     assert "if use_gemma4_mtp:" in base_propose
     assert "build_constant_position_multi_step_metadata" in base_propose
-    assert "for layer_name in attn_group.layer_names:" in gemma_helper
-    assert "keep_positions_and_seq_lens=True" in gemma_helper
+    assert "for layer_name in attn_group.layer_names:" in step_builder
+    assert "keep_positions_and_seq_lens=True" in step_builder
 
 
 def test_gemma4_mtp_constant_metadata_does_not_mutate_position_input():
@@ -133,10 +133,53 @@ def test_gemma4_mtp_constant_metadata_does_not_mutate_position_input():
     assert "used_update_positions += 1" not in source
 
 
-def test_gemma4_mtp_reinitializes_metadata_shape_for_every_draft_step():
-    source = _method_source_from(BASE_SOURCE, "attn_update_stack_num_spec_norm")
+def test_gemma4_mtp_reuses_only_supported_singlecard_followup_metadata():
+    dispatcher = _method_source("build_constant_position_multi_step_metadata")
+    guard = _method_source("_can_reuse_singlecard_multistep_metadata")
+    reuse = _method_source("_build_reused_singlecard_multistep_metadata")
+    fallback = _method_source("_build_per_step_constant_position_metadata")
 
-    assert "if draft_step == 1 or keep_positions_and_seq_lens:" in source
+    assert "if self.num_speculative_tokens <= 1:" in dispatcher
+    assert "_can_reuse_singlecard_multistep_metadata" in dispatcher
+    assert "_build_reused_singlecard_multistep_metadata" in dispatcher
+    assert "_build_per_step_constant_position_metadata" in dispatcher
+
+    for contract in [
+        "self.constant_draft_positions",
+        "self.pcp_size == 1",
+        "self.dcp_size == 1",
+        "parallel_config.tensor_parallel_size == 1",
+        "parallel_config.pipeline_parallel_size == 1",
+        "parallel_config.data_parallel_size == 1",
+        "not self.use_cuda_graph",
+        "aclgraph_runtime_mode == CUDAGraphMode.NONE",
+        "not self.use_compress",
+        "ori_seq_len is None",
+        "slot_indices is None",
+        "mtp_slot_mapping is None",
+    ]:
+        assert contract in guard
+
+    assert "draft_step=1" in reuse
+    assert "clone_update_inputs=False" in reuse
+    assert "[per_layer_attn_metadata] *" in reuse
+
+    assert (
+        "for draft_step in range(1, self.num_speculative_tokens):"
+        in fallback
+    )
+    assert "clone_update_inputs=True" in fallback
+
+
+def test_gemma4_metadata_reuse_excludes_draft_index_sensitive_builder_path():
+    source = _method_source_from(
+        BASE_SOURCE,
+        "attn_update_stack_num_spec_norm",
+    )
+
+    assert "if self.use_compress:" in source
+    assert "build_for_drafting(\n                draft_step," in source
+    assert "attn_metadata_builder.build(\n                0," in source
 
 
 def test_gemma4_mtp_merged_draft_keeps_model_positions_constant():
@@ -195,7 +238,8 @@ if __name__ == "__main__":
     test_run_merged_draft_initializes_gemma4_mtp_flag_before_use()
     test_gemma4_mtp_uses_constant_position_multistep_metadata_helper()
     test_gemma4_mtp_constant_metadata_does_not_mutate_position_input()
-    test_gemma4_mtp_reinitializes_metadata_shape_for_every_draft_step()
+    test_gemma4_mtp_reuses_only_supported_singlecard_followup_metadata()
+    test_gemma4_metadata_reuse_excludes_draft_index_sensitive_builder_path()
     test_gemma4_mtp_merged_draft_keeps_model_positions_constant()
     test_gemma4_mtp_eager_followup_uses_real_batch_size()
     test_ascend_base_defaults_to_advancing_draft_positions()
