@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 
@@ -69,6 +69,161 @@ class AscendGemma4Proposer(Gemma4Proposer, AscendSpecDecodeBaseProposer):
                 target_layer_name,
             )
 
+    def _can_reuse_singlecard_multistep_metadata(
+        self,
+        aclgraph_runtime_mode,
+        ori_seq_len=None,
+        slot_indices=None,
+        mtp_slot_mapping=None,
+    ) -> bool:
+        """Return whether all follow-up draft steps have identical metadata."""
+        parallel_config = self.vllm_config.parallel_config
+        return (
+            self.constant_draft_positions
+            and bool(self.draft_attn_groups)
+            and self.pcp_size == 1
+            and self.dcp_size == 1
+            and parallel_config.tensor_parallel_size == 1
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.data_parallel_size == 1
+            and not self.use_cuda_graph
+            and aclgraph_runtime_mode == CUDAGraphMode.NONE
+            and not self.use_compress
+            and ori_seq_len is None
+            and slot_indices is None
+            and mtp_slot_mapping is None
+        )
+
+    def _build_constant_position_step_metadata(
+        self,
+        common_attn_metadata,
+        initial_per_layer_attn_metadata: dict[str, object],
+        batch_size: int,
+        num_input_tokens: int,
+        used_update_positions: torch.Tensor,
+        aclgraph_runtime_mode,
+        draft_step: int,
+        ori_seq_len=None,
+        slot_indices=None,
+        mtp_slot_mapping=None,
+        *,
+        clone_update_inputs: bool,
+    ) -> dict[str, object]:
+        """Build one follow-up step while preserving KV-group ownership."""
+        per_layer_attn_metadata: dict[str, object] = {}
+
+        for attn_group in self.draft_attn_groups:
+            group_common_attn_metadata = self.shallow_copy_metadata(
+                common_attn_metadata
+            )
+            group_id = attn_group.kv_cache_group_id
+            group_block_table = self._per_group_block_tables.get(group_id)
+            if group_block_table is not None:
+                group_common_attn_metadata.block_table_tensor = (
+                    group_block_table[:batch_size]
+                )
+
+            update_positions = (
+                used_update_positions.clone()
+                if clone_update_inputs
+                else used_update_positions
+            )
+            update_slot_indices = (
+                None
+                if slot_indices is None
+                else (
+                    slot_indices.clone()
+                    if clone_update_inputs
+                    else slot_indices
+                )
+            )
+
+            first_layer_name = attn_group.layer_names[0]
+            _, attn_metadata = self.attn_update_stack_num_spec_norm(
+                draft_step,
+                initial_per_layer_attn_metadata[first_layer_name],
+                group_common_attn_metadata,
+                batch_size,
+                num_input_tokens,
+                update_positions,
+                aclgraph_runtime_mode,
+                ori_seq_len,
+                update_slot_indices,
+                mtp_slot_mapping,
+                attn_group=attn_group,
+                keep_positions_and_seq_lens=True,
+            )
+
+            # The builder retains a view into slot_mapping_group[draft_step].
+            # Clone once per group before the next group overwrites the buffer.
+            attn_metadata.slot_mapping = attn_metadata.slot_mapping.clone()
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+
+        return per_layer_attn_metadata
+
+    def _build_reused_singlecard_multistep_metadata(
+        self,
+        common_attn_metadata,
+        initial_per_layer_attn_metadata: dict[str, object],
+        batch_size: int,
+        num_input_tokens: int,
+        used_update_positions: torch.Tensor,
+        aclgraph_runtime_mode,
+    ) -> list[dict[str, object]]:
+        """Build one follow-up metadata set and reuse it for all draft steps."""
+        per_layer_attn_metadata = self._build_constant_position_step_metadata(
+            common_attn_metadata,
+            initial_per_layer_attn_metadata,
+            batch_size,
+            num_input_tokens,
+            used_update_positions,
+            aclgraph_runtime_mode,
+            draft_step=1,
+            clone_update_inputs=False,
+        )
+        return [per_layer_attn_metadata] * (
+            self.num_speculative_tokens - 1
+        )
+
+    def _build_per_step_constant_position_metadata(
+        self,
+        common_attn_metadata,
+        initial_per_layer_attn_metadata: dict[str, object],
+        batch_size: int,
+        num_input_tokens: int,
+        used_update_positions: torch.Tensor,
+        aclgraph_runtime_mode,
+        ori_seq_len=None,
+        slot_indices=None,
+        mtp_slot_mapping=None,
+    ) -> list[dict[str, object]]:
+        """Build independent metadata for unsupported or distributed paths."""
+        multi_steps_attn_metadata: list[dict[str, object]] = []
+        step_slot_indices = slot_indices
+
+        for draft_step in range(1, self.num_speculative_tokens):
+            per_layer_attn_metadata = (
+                self._build_constant_position_step_metadata(
+                    common_attn_metadata,
+                    initial_per_layer_attn_metadata,
+                    batch_size,
+                    num_input_tokens,
+                    used_update_positions,
+                    aclgraph_runtime_mode,
+                    draft_step=draft_step,
+                    ori_seq_len=ori_seq_len,
+                    slot_indices=step_slot_indices,
+                    mtp_slot_mapping=mtp_slot_mapping,
+                    clone_update_inputs=True,
+                )
+            )
+            multi_steps_attn_metadata.append(per_layer_attn_metadata)
+            if step_slot_indices is not None:
+                step_slot_indices = step_slot_indices + self.pcp_size
+
+        return multi_steps_attn_metadata
+
     def build_constant_position_multi_step_metadata(
         self,
         common_attn_metadata,
@@ -81,50 +236,41 @@ class AscendGemma4Proposer(Gemma4Proposer, AscendSpecDecodeBaseProposer):
         slot_indices=None,
         mtp_slot_mapping=None,
     ) -> list[dict[str, object]]:
-        """Build Gemma4 draft metadata without advancing target state.
+        """Build Gemma4 follow-up metadata without advancing target state.
 
         Gemma4 assistant steps reuse the last target position. Each attention
         group owns a distinct KV block table, so its metadata must be built
         independently and retained for only that group's layers.
         """
-        multi_steps_attn_metadata: list[dict[str, object]] = []
-        step_slot_indices = slot_indices
+        if self.num_speculative_tokens <= 1:
+            return []
 
-        for draft_step in range(1, self.num_speculative_tokens):
-            per_layer_attn_metadata: dict[str, object] = {}
-            for attn_group in self.draft_attn_groups:
-                group_common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
-                group_id = attn_group.kv_cache_group_id
-                group_block_table = self._per_group_block_tables.get(group_id)
-                if group_block_table is not None:
-                    group_common_attn_metadata.block_table_tensor = group_block_table[:batch_size]
+        if self._can_reuse_singlecard_multistep_metadata(
+            aclgraph_runtime_mode,
+            ori_seq_len=ori_seq_len,
+            slot_indices=slot_indices,
+            mtp_slot_mapping=mtp_slot_mapping,
+        ):
+            return self._build_reused_singlecard_multistep_metadata(
+                common_attn_metadata,
+                initial_per_layer_attn_metadata,
+                batch_size,
+                num_input_tokens,
+                used_update_positions,
+                aclgraph_runtime_mode,
+            )
 
-                first_layer_name = attn_group.layer_names[0]
-                _, attn_metadata = self.attn_update_stack_num_spec_norm(
-                    draft_step,
-                    initial_per_layer_attn_metadata[first_layer_name],
-                    group_common_attn_metadata,
-                    batch_size,
-                    num_input_tokens,
-                    used_update_positions.clone(),
-                    aclgraph_runtime_mode,
-                    ori_seq_len,
-                    None if step_slot_indices is None else step_slot_indices.clone(),
-                    mtp_slot_mapping,
-                    attn_group=attn_group,
-                    keep_positions_and_seq_lens=True,
-                )
-                # The Ascend builder retains a view into slot_mapping_group.
-                # Preserve this group's mapping before the next group updates it.
-                attn_metadata.slot_mapping = attn_metadata.slot_mapping.clone()
-                for layer_name in attn_group.layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata
-
-            multi_steps_attn_metadata.append(per_layer_attn_metadata)
-            if step_slot_indices is not None:
-                step_slot_indices = step_slot_indices + self.pcp_size
-
-        return multi_steps_attn_metadata
+        return self._build_per_step_constant_position_metadata(
+            common_attn_metadata,
+            initial_per_layer_attn_metadata,
+            batch_size,
+            num_input_tokens,
+            used_update_positions,
+            aclgraph_runtime_mode,
+            ori_seq_len=ori_seq_len,
+            slot_indices=slot_indices,
+            mtp_slot_mapping=mtp_slot_mapping,
+        )
 
     def _setup_centroids_cuda_graphs(self) -> None:
         """Skip CUDA graph capture on Ascend.
