@@ -28,7 +28,12 @@ def _load_summarizer():
     return module
 
 
-def _write_report(report_dir: Path, *, weight_count: int = 480) -> None:
+def _write_report(
+    report_dir: Path,
+    *,
+    weight_count: int = 480,
+    weight_op_type: str = "WeightQuantBatchMatmulV2",
+) -> None:
     report_dir.mkdir(parents=True)
     with (report_dir / "op_statistic.csv").open(
         "w",
@@ -54,7 +59,7 @@ def _write_report(report_dir: Path, *, weight_count: int = 480) -> None:
             [
                 {
                     "Device_id": "0",
-                    "OP Type": "WeightQuantBatchMatmulV2",
+                    "OP Type": weight_op_type,
                     "Core Type": "MIX_AIC",
                     "Count": str(weight_count),
                     "Total Time(us)": "2000",
@@ -164,6 +169,23 @@ def test_profile_summary_rejects_non_integral_target_steps():
             module.analyze_report(report_dir, label="invalid")
 
 
+def test_profile_summary_accepts_weight_quant_kernel_suffix():
+    module = _load_summarizer()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        report_dir = Path(temp_dir) / "ASCEND_PROFILER_OUTPUT"
+        _write_report(
+            report_dir,
+            weight_op_type=(
+                "WeightQuantBatchMatmulV2_bf16_int4_bf16_"
+                "high_performance_356262168888065"
+            ),
+        )
+
+        result = module.analyze_report(report_dir, label="suffixed")
+
+    assert result["target_steps"] == 2
+
+
 def test_profile_summary_rejects_old_new_token_mismatch():
     module = _load_summarizer()
     base = {
@@ -260,6 +282,7 @@ def test_profile_summary_rejects_old_new_sampling_mismatch():
 if __name__ == "__main__":
     test_profile_summary_classifies_legacy_and_compact_kernels()
     test_profile_summary_rejects_non_integral_target_steps()
+    test_profile_summary_accepts_weight_quant_kernel_suffix()
     test_profile_summary_rejects_old_new_token_mismatch()
     test_profile_runner_manifest_records_sampling_and_full_profiler_config()
     test_profile_summary_rejects_old_new_sampling_mismatch()

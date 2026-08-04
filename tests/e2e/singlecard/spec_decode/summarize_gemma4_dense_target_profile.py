@@ -79,7 +79,7 @@ def analyze_report(report_dir: Path, *, label: str) -> dict[str, object]:
     weight_count = sum(
         int(_number(row, "Count"))
         for row in op_rows
-        if row.get("OP Type") == WEIGHT_QUANT_OP
+        if row.get("OP Type", "").startswith(WEIGHT_QUANT_OP)
     )
     if (
         weight_count <= 0
