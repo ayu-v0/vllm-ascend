@@ -105,10 +105,16 @@ def test_gemma4_mtp_logs_paged_kv_gather_bounds():
     assert "paged KV block id is out of range" in source
 
 
-def test_gemma4_mtp_gather_owns_block_id_tensor():
+def test_gemma4_mtp_compact_gather_owns_group_snapshot():
     source = (SOURCE.parents[1] / "attention" / "attention_v1.py").read_text(encoding="utf-8")
 
-    assert "block_table = block_table[: len(seq_lens), :num_blocks].long().clone()" in source
+    assert "class CompactPagedKVMetadata" in source
+    assert "compact_paged_kv: CompactPagedKVMetadata | None = None" in source
+    assert "def _build_compact_paged_kv_metadata(" in source
+    assert "].long().clone()" in source
+    assert "def _can_use_singlecard_compact_paged_kv(" in source
+    assert "def _gather_paged_kv_to_dense_compact(" in source
+    assert "def _gather_paged_kv_to_dense_legacy(" in source
 
 
 def test_gemma4_mtp_passes_current_count_to_async_output_only():
@@ -244,6 +250,6 @@ if __name__ == "__main__":
     test_gemma4_mtp_logs_target_verification_inputs_and_logits()
     test_gemma4_mtp_logs_async_state_handoff_boundaries()
     test_gemma4_mtp_logs_paged_kv_gather_bounds()
-    test_gemma4_mtp_gather_owns_block_id_tensor()
+    test_gemma4_mtp_compact_gather_owns_group_snapshot()
     test_gemma4_mtp_passes_current_count_to_async_output_only()
     test_gemma4_mtp_collects_async_state_snapshots_without_early_host_reads()

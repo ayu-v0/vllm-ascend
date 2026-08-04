@@ -9,6 +9,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
     AscendAttentionMetadataBuilder,
     AscendAttentionState,
+    AscendMetadata,
     AttentionGraphParam,
     _normalize_graph_param,
 )
@@ -169,6 +170,12 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.layer_no_quant._k_scale_float = 1.0
         self.layer_no_quant._v_scale_float = 1.0
         self.mock_vllm_config = MagicMock()
+        self.mock_vllm_config.quant_config = None
+        self.mock_vllm_config.parallel_config.tensor_parallel_size = 1
+        self.mock_vllm_config.parallel_config.pipeline_parallel_size = 1
+        self.mock_vllm_config.parallel_config.data_parallel_size = 1
+        self.mock_vllm_config.parallel_config.prefill_context_parallel_size = 1
+        self.mock_vllm_config.parallel_config.decode_context_parallel_size = 1
         self.config_patcher = patch(
             "vllm_ascend.attention.attention_v1.get_current_vllm_config", return_value=self.mock_vllm_config
         )
@@ -268,16 +275,22 @@ class TestAscendAttentionBackendImpl(TestBase):
 
     def test_gather_paged_kv_to_dense(self):
         block_size = 2
-        key_cache = torch.arange(4 * block_size * 8 * 64).reshape(4, block_size, 8, 64)
+        key_cache = torch.arange(
+            4 * block_size * 8 * 64,
+            dtype=torch.float32,
+        ).to(torch.float16).reshape(4, block_size, 8, 64)
         value_cache = key_cache + 10000
         block_table = torch.tensor([[1, 3], [0, 2]])
         seq_lens = [3, 4]
+        metadata = AscendMetadata(
+            block_tables=block_table,
+            seq_lens_list=seq_lens,
+        )
 
-        dense_key, dense_value = self.impl._gather_paged_kv_to_dense(
+        dense_key, dense_value, actual_seq_lengths = self.impl._gather_paged_kv_to_dense(
             key_cache,
             value_cache,
-            block_table,
-            seq_lens,
+            metadata,
         )
 
         expected_key = torch.cat(
@@ -292,6 +305,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         expected_value = expected_key + 10000
         torch.testing.assert_close(dense_key, expected_key)
         torch.testing.assert_close(dense_value, expected_value)
+        self.assertEqual(actual_seq_lengths, [3, 7])
 
     def test_forward_no_attn_metadata(self):
         """Test forward pass when attn_metadata is None"""

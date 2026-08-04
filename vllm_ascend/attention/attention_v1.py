@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import itertools
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, NamedTuple
@@ -80,6 +81,7 @@ FIA_TND_SUPPORTED_HEAD_SIZES = {64, 128, 192}
 GraphParamKind = Literal["paged_attention", "fia"]
 logger = init_logger(__name__)
 _GEMMA4_MTP_DEBUG = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_DEBUG
+_GEMMA4_MTP_ORACLE = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_ORACLE
 
 
 def _debug_shape(value: object) -> tuple[int, ...] | None:
@@ -234,6 +236,153 @@ class AscendAttentionState(Enum):
 
 
 @dataclass
+class CompactPagedKVMetadata:
+    """Forward-scoped physical slots shared by one KV cache group."""
+
+    physical_slots: torch.Tensor
+    block_table_snapshot: torch.Tensor
+    actual_seq_lengths_kv: list[int]
+    seq_lens: tuple[int, ...]
+    block_size: int
+    cache_block_capacity: int
+    source_block_table_data_ptr: int
+    source_block_table_shape: tuple[int, ...]
+    source_block_table_stride: tuple[int, ...]
+    source_block_table_dtype: torch.dtype
+    source_block_table_device: torch.device
+
+
+def _build_compact_paged_kv_metadata(
+    block_table: torch.Tensor,
+    seq_lens: list[int],
+    *,
+    block_size: int,
+    cache_block_capacity: int,
+) -> CompactPagedKVMetadata:
+    """Build sequence-major physical slots without rectangular KV padding."""
+
+    if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size <= 0:
+        raise ValueError(f"block_size must be a positive integer, got {block_size!r}")
+    if (
+        isinstance(cache_block_capacity, bool)
+        or not isinstance(cache_block_capacity, int)
+        or cache_block_capacity <= 0
+    ):
+        raise ValueError(
+            "cache_block_capacity must be a positive integer, "
+            f"got {cache_block_capacity!r}"
+        )
+    if block_table.ndim != 2:
+        raise ValueError(
+            "block_table must be 2-D, "
+            f"got shape={tuple(block_table.shape)}"
+        )
+    if block_table.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            "block_table must use int32 or int64, "
+            f"got dtype={block_table.dtype}"
+        )
+    if not isinstance(seq_lens, list):
+        raise TypeError(
+            "seq_lens must be a list of non-negative integers, "
+            f"got type={type(seq_lens).__name__}"
+        )
+    if any(
+        isinstance(seq_len, bool) or not isinstance(seq_len, int)
+        for seq_len in seq_lens
+    ):
+        raise TypeError("seq_lens must contain non-negative integers")
+    if any(seq_len < 0 for seq_len in seq_lens):
+        raise ValueError("seq_lens must contain non-negative integers")
+
+    batch_size = len(seq_lens)
+    total_tokens = sum(seq_lens)
+    max_seq_len = max(seq_lens, default=0)
+    required_block_cols = cdiv(max_seq_len, block_size) if max_seq_len else 0
+    if block_table.shape[0] < batch_size:
+        raise ValueError(
+            "block_table row count is smaller than the sequence batch: "
+            f"rows={block_table.shape[0]} batch_size={batch_size}"
+        )
+    if block_table.shape[1] < required_block_cols:
+        raise ValueError(
+            "block_table has insufficient logical block columns: "
+            f"cols={block_table.shape[1]} required={required_block_cols} "
+            f"max_seq_len={max_seq_len} block_size={block_size}"
+        )
+
+    actual_seq_lengths_kv = list(itertools.accumulate(seq_lens))
+    block_table_snapshot = block_table[
+        :batch_size,
+        :required_block_cols,
+    ].long().clone().contiguous()
+    if total_tokens == 0:
+        physical_slots = block_table.new_empty((0,), dtype=torch.long)
+    else:
+        sequence_starts = [0, *itertools.accumulate(seq_lens[:-1])]
+        seq_lens_tensor = torch.tensor(
+            seq_lens,
+            dtype=torch.long,
+            device=block_table.device,
+        )
+        sequence_ids = torch.arange(
+            batch_size,
+            dtype=torch.long,
+            device=block_table.device,
+        ).repeat_interleave(
+            seq_lens_tensor,
+            output_size=total_tokens,
+        )
+        sequence_starts_tensor = torch.tensor(
+            sequence_starts,
+            dtype=torch.long,
+            device=block_table.device,
+        )
+        token_offsets = (
+            torch.arange(
+                total_tokens,
+                dtype=torch.long,
+                device=block_table.device,
+            )
+            - sequence_starts_tensor.index_select(0, sequence_ids)
+        )
+        logical_block_indices = torch.div(
+            token_offsets,
+            block_size,
+            rounding_mode="floor",
+        )
+        in_block_offsets = torch.remainder(token_offsets, block_size)
+        flat_block_table_indices = (
+            sequence_ids * required_block_cols + logical_block_indices
+        )
+        physical_block_ids = block_table_snapshot.reshape(-1).index_select(
+            0,
+            flat_block_table_indices,
+        )
+        physical_slots = physical_block_ids * block_size + in_block_offsets
+
+    if physical_slots.numel() != total_tokens:
+        raise RuntimeError(
+            "Compact paged KV slot count does not match the logical token "
+            f"count: slots={physical_slots.numel()} total_tokens={total_tokens}"
+        )
+
+    return CompactPagedKVMetadata(
+        physical_slots=physical_slots,
+        block_table_snapshot=block_table_snapshot,
+        actual_seq_lengths_kv=actual_seq_lengths_kv,
+        seq_lens=tuple(seq_lens),
+        block_size=block_size,
+        cache_block_capacity=cache_block_capacity,
+        source_block_table_data_ptr=block_table.data_ptr(),
+        source_block_table_shape=tuple(block_table.shape),
+        source_block_table_stride=tuple(block_table.stride()),
+        source_block_table_dtype=block_table.dtype,
+        source_block_table_device=block_table.device,
+    )
+
+
+@dataclass
 class AscendMetadata:
     """
     Per-layer attention metadata for Ascend FlashAttention backend.
@@ -294,6 +443,10 @@ class AscendMetadata:
     reshape_cache_event: torch.npu.Event = None
 
     kvcomp_metadata: KVCompMetaData | None = None
+
+    # Lazily initialized by Gemma4's single-card large-head fallback. Layers
+    # in the same KV cache group share this AscendMetadata instance.
+    compact_paged_kv: CompactPagedKVMetadata | None = None
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -1438,72 +1591,248 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Chunked prefill can have historical KV already resident in the paged
         # cache. The large-head fallback uses dense TND attention, so gather the
         # paged KV blocks into sequence-major dense tensors first.
-        dense_key, dense_value = self._gather_paged_kv_to_dense(
+        return self._gather_paged_kv_to_dense(
             self.key_cache,
             self.value_cache,
-            attn_metadata.block_tables,
-            seq_lens,
+            attn_metadata,
         )
-        actual_seq_lengths_kv = torch.tensor(seq_lens, dtype=torch.int32).cumsum(0).tolist()
-        return dense_key, dense_value, actual_seq_lengths_kv
 
     def _gather_paged_kv_to_dense(
         self,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
+        attn_metadata: AscendMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        if self._can_use_singlecard_compact_paged_kv():
+            return self._gather_paged_kv_to_dense_compact(
+                key_cache,
+                value_cache,
+                attn_metadata,
+            )
+        return self._gather_paged_kv_to_dense_legacy(
+            key_cache,
+            value_cache,
+            attn_metadata,
+        )
+
+    def _can_use_singlecard_compact_paged_kv(self) -> bool:
+        parallel_config = self.vllm_config.parallel_config
+        return (
+            parallel_config.tensor_parallel_size == 1
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.data_parallel_size == 1
+            and parallel_config.prefill_context_parallel_size == 1
+            and parallel_config.decode_context_parallel_size == 1
+        )
+
+    def _validate_compact_paged_kv_cache(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        layer_type = "sliding" if self.sliding_window is not None else "full"
+        context = (
+            f"layer={self._layer_name} layer_type={layer_type} "
+            f"target={self.kv_sharing_target_layer_name}"
+        )
+        if self.enable_c8_quant:
+            raise TypeError(
+                "Compact paged KV gather does not support C8/INT8 cache: "
+                f"{context}"
+            )
+        if key_cache.ndim != 4 or value_cache.ndim != 4:
+            raise ValueError(
+                "Compact paged KV cache must be 4-D: "
+                f"{context} key_shape={tuple(key_cache.shape)} "
+                f"value_shape={tuple(value_cache.shape)}"
+            )
+        if key_cache.shape != value_cache.shape:
+            raise ValueError(
+                "Compact paged Key/Value cache shapes differ: "
+                f"{context} key_shape={tuple(key_cache.shape)} "
+                f"value_shape={tuple(value_cache.shape)}"
+            )
+        if key_cache.shape[0] <= 0 or key_cache.shape[1] <= 0:
+            raise ValueError(
+                "Compact paged KV cache capacity and block size must be "
+                f"positive: {context} cache_shape={tuple(key_cache.shape)}"
+            )
+        if key_cache.shape[2:] != (self.num_kv_heads, self.head_size):
+            raise ValueError(
+                "Compact paged KV cache layout does not match the attention "
+                f"layer: {context} cache_shape={tuple(key_cache.shape)} "
+                f"expected_heads={self.num_kv_heads} "
+                f"expected_head_size={self.head_size}"
+            )
+        if key_cache.device != value_cache.device:
+            raise ValueError(
+                "Compact paged Key/Value cache devices differ: "
+                f"{context} key_device={key_cache.device} "
+                f"value_device={value_cache.device}"
+            )
+        if key_cache.dtype != value_cache.dtype:
+            raise TypeError(
+                "Compact paged Key/Value cache dtypes differ: "
+                f"{context} key_dtype={key_cache.dtype} "
+                f"value_dtype={value_cache.dtype}"
+            )
+        if key_cache.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(
+                "Compact paged KV gather supports only BF16/FP16 cache: "
+                f"{context} cache_dtype={key_cache.dtype}"
+            )
+        if not key_cache.is_contiguous() or not value_cache.is_contiguous():
+            raise ValueError(
+                "Compact paged KV cache must be contiguous: "
+                f"{context} key_contiguous={key_cache.is_contiguous()} "
+                f"value_contiguous={value_cache.is_contiguous()}"
+            )
+        block_table = attn_metadata.block_tables
+        if not torch.is_tensor(block_table):
+            raise TypeError(
+                "Compact paged KV metadata requires a block table tensor: "
+                f"{context} block_table_type={type(block_table).__name__}"
+            )
+        if block_table.device != key_cache.device:
+            raise ValueError(
+                "Compact paged block table and KV cache devices differ: "
+                f"{context} block_table_device={block_table.device} "
+                f"cache_device={key_cache.device}"
+            )
+        if attn_metadata.seq_lens_list is None:
+            raise ValueError(
+                "Compact paged KV metadata requires seq_lens_list: "
+                f"{context}"
+            )
+
+    @staticmethod
+    def _compact_paged_kv_signature(
         block_table: torch.Tensor,
+        seq_lens: list[int],
+        key_cache: torch.Tensor,
+    ) -> tuple[object, ...]:
+        return (
+            tuple(seq_lens),
+            key_cache.shape[1],
+            key_cache.shape[0],
+            block_table.data_ptr(),
+            tuple(block_table.shape),
+            tuple(block_table.stride()),
+            block_table.dtype,
+            block_table.device,
+        )
+
+    @staticmethod
+    def _cached_compact_paged_kv_signature(
+        compact: CompactPagedKVMetadata,
+    ) -> tuple[object, ...]:
+        return (
+            compact.seq_lens,
+            compact.block_size,
+            compact.cache_block_capacity,
+            compact.source_block_table_data_ptr,
+            compact.source_block_table_shape,
+            compact.source_block_table_stride,
+            compact.source_block_table_dtype,
+            compact.source_block_table_device,
+        )
+
+    def _get_or_build_compact_paged_kv_metadata(
+        self,
+        attn_metadata: AscendMetadata,
+        key_cache: torch.Tensor,
+    ) -> CompactPagedKVMetadata:
+        block_table = attn_metadata.block_tables
+        seq_lens = attn_metadata.seq_lens_list
+        signature = self._compact_paged_kv_signature(
+            block_table,
+            seq_lens,
+            key_cache,
+        )
+        compact = attn_metadata.compact_paged_kv
+        if compact is None:
+            compact = _build_compact_paged_kv_metadata(
+                block_table,
+                seq_lens,
+                block_size=key_cache.shape[1],
+                cache_block_capacity=key_cache.shape[0],
+            )
+            attn_metadata.compact_paged_kv = compact
+            return compact
+
+        cached_signature = self._cached_compact_paged_kv_signature(compact)
+        if signature != cached_signature:
+            layer_type = "sliding" if self.sliding_window is not None else "full"
+            raise RuntimeError(
+                "Stale compact paged KV metadata cannot be reused: "
+                f"layer={self._layer_name} layer_type={layer_type} "
+                f"target={self.kv_sharing_target_layer_name} "
+                f"cached_signature={cached_signature} "
+                f"current_signature={signature}"
+            )
+        return compact
+
+    def _log_paged_kv_gather_bounds(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        input_block_table: torch.Tensor,
+        selected_block_table: torch.Tensor,
+        selected_block_ids: torch.Tensor,
+        seq_lens: list[int],
+    ) -> None:
+        if not _GEMMA4_MTP_DEBUG or selected_block_ids.numel() == 0:
+            return
+        selected_block_ids_cpu = selected_block_ids.detach().cpu()
+        flat_block_id_min = int(selected_block_ids_cpu.min().item())
+        flat_block_id_max = int(selected_block_ids_cpu.max().item())
+        cache_block_capacity = key_cache.shape[0]
+        logger.warning(
+            "Gemma4 MTP debug: paged_kv_gather "
+            "layer=%s target=%s key_cache_shape=%s value_cache_shape=%s "
+            "block_table_shape=%s selected_block_table_shape=%s "
+            "block_size=%s num_blocks=%s seq_lens=%s "
+            "flat_block_id_min=%s flat_block_id_max=%s "
+            "cache_block_capacity=%s",
+            self._layer_name,
+            self.kv_sharing_target_layer_name,
+            _debug_shape(key_cache),
+            _debug_shape(value_cache),
+            _debug_shape(input_block_table),
+            _debug_shape(selected_block_table),
+            key_cache.shape[1],
+            selected_block_table.shape[1],
+            _debug_preview(seq_lens),
+            flat_block_id_min,
+            flat_block_id_max,
+            cache_block_capacity,
+        )
+        if flat_block_id_min < 0 or flat_block_id_max >= cache_block_capacity:
+            raise RuntimeError(
+                "Gemma4 MTP paged KV block id is out of range: "
+                f"layer={self._layer_name} "
+                f"target={self.kv_sharing_target_layer_name} "
+                f"min={flat_block_id_min} max={flat_block_id_max} "
+                f"cache_block_capacity={cache_block_capacity} "
+                f"key_cache_shape={tuple(key_cache.shape)} "
+                f"block_table_shape={tuple(input_block_table.shape)}"
+            )
+
+    def _gather_paged_kv_snapshot_to_dense_reference(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table_snapshot: torch.Tensor,
         seq_lens: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         block_size = key_cache.shape[1]
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.long, device=key_cache.device)
-        max_seq_len = int(seq_lens_tensor.max().item())
-        num_blocks = cdiv(max_seq_len, block_size)
-        input_block_table_shape = _debug_shape(block_table)
-        # The runner reuses the source block-table buffer on subsequent
-        # scheduler steps. Keep an NPU-owned snapshot for the asynchronous
-        # gather so its indices cannot be mutated after this forward is queued.
-        block_table = block_table[: len(seq_lens), :num_blocks].long().clone()
-
-        flat_block_ids = block_table.reshape(-1)
-        if _GEMMA4_MTP_DEBUG and flat_block_ids.numel():
-            # This path is only used by Gemma4's large-head shared-KV fallback.
-            # Materialize the small block-id vector on CPU before index_select so
-            # an invalid mapping is reported with its ownership context instead
-            # of surfacing later as an asynchronous NPU gather failure.
-            flat_block_ids_cpu = flat_block_ids.detach().cpu()
-            flat_block_id_min = int(flat_block_ids_cpu.min().item())
-            flat_block_id_max = int(flat_block_ids_cpu.max().item())
-            cache_block_capacity = key_cache.shape[0]
-            logger.warning(
-                "Gemma4 MTP debug: paged_kv_gather "
-                "layer=%s target=%s key_cache_shape=%s value_cache_shape=%s "
-                "block_table_shape=%s selected_block_table_shape=%s "
-                "block_size=%s num_blocks=%s seq_lens=%s "
-                "flat_block_id_min=%s flat_block_id_max=%s "
-                "cache_block_capacity=%s",
-                getattr(self, "_layer_name", None),
-                self.kv_sharing_target_layer_name,
-                _debug_shape(key_cache),
-                _debug_shape(value_cache),
-                input_block_table_shape,
-                _debug_shape(block_table),
-                block_size,
-                num_blocks,
-                _debug_preview(seq_lens),
-                flat_block_id_min,
-                flat_block_id_max,
-                cache_block_capacity,
-            )
-            if flat_block_id_min < 0 or flat_block_id_max >= cache_block_capacity:
-                raise RuntimeError(
-                    "Gemma4 MTP paged KV block id is out of range: "
-                    f"layer={getattr(self, '_layer_name', None)} "
-                    f"target={self.kv_sharing_target_layer_name} "
-                    f"min={flat_block_id_min} max={flat_block_id_max} "
-                    f"cache_block_capacity={cache_block_capacity} "
-                    f"key_cache_shape={tuple(key_cache.shape)} "
-                    f"block_table_shape={tuple(block_table.shape)}"
-                )
+        seq_lens_tensor = torch.tensor(
+            seq_lens,
+            dtype=torch.long,
+            device=key_cache.device,
+        )
+        num_blocks = block_table_snapshot.shape[1]
         max_tokens_padded = num_blocks * block_size
         dense_shape = (
             len(seq_lens),
@@ -1511,12 +1840,170 @@ class AscendAttentionBackendImpl(AttentionImpl):
             self.num_kv_heads,
             self.head_size,
         )
-        gathered_key = key_cache.index_select(0, flat_block_ids).reshape(dense_shape)
-        gathered_value = value_cache.index_select(0, flat_block_ids).reshape(dense_shape)
-
-        positions = torch.arange(max_tokens_padded, dtype=torch.long, device=key_cache.device)
+        flat_block_ids = block_table_snapshot.reshape(-1)
+        gathered_key = key_cache.index_select(0, flat_block_ids).reshape(
+            dense_shape
+        )
+        gathered_value = value_cache.index_select(0, flat_block_ids).reshape(
+            dense_shape
+        )
+        positions = torch.arange(
+            max_tokens_padded,
+            dtype=torch.long,
+            device=key_cache.device,
+        )
         valid_mask = positions.unsqueeze(0) < seq_lens_tensor.unsqueeze(1)
-        return gathered_key[valid_mask].contiguous(), gathered_value[valid_mask].contiguous()
+        return (
+            gathered_key[valid_mask].contiguous(),
+            gathered_value[valid_mask].contiguous(),
+        )
+
+    def _assert_compact_kv_oracle_equal(
+        self,
+        new_key: torch.Tensor,
+        new_value: torch.Tensor,
+        old_key: torch.Tensor,
+        old_value: torch.Tensor,
+        compact: CompactPagedKVMetadata,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        layer_type = "sliding" if self.sliding_window is not None else "full"
+        context = (
+            f"layer={self._layer_name} layer_type={layer_type} "
+            f"target={self.kv_sharing_target_layer_name} "
+            f"seq_lens={attn_metadata.seq_lens_list} "
+            f"block_table_snapshot_shape={tuple(compact.block_table_snapshot.shape)} "
+            f"physical_slots_shape={tuple(compact.physical_slots.shape)}"
+        )
+        for name, new, old in (
+            ("key", new_key, old_key),
+            ("value", new_value, old_value),
+        ):
+            if new.shape != old.shape or new.dtype != old.dtype or new.device != old.device:
+                raise RuntimeError(
+                    "Gemma4 compact paged KV oracle metadata mismatch: "
+                    f"tensor={name} {context} new_shape={tuple(new.shape)} "
+                    f"old_shape={tuple(old.shape)} new_dtype={new.dtype} "
+                    f"old_dtype={old.dtype} new_device={new.device} "
+                    f"old_device={old.device}"
+                )
+            if torch.equal(new, old):
+                continue
+            mismatch = torch.ne(new, old).reshape(-1)
+            first_mismatch_flat_index = int(
+                torch.nonzero(mismatch, as_tuple=False)[0].item()
+            )
+            new_scalar = new.reshape(-1)[first_mismatch_flat_index].item()
+            old_scalar = old.reshape(-1)[first_mismatch_flat_index].item()
+            raise RuntimeError(
+                "Gemma4 compact paged KV oracle mismatch: "
+                f"tensor={name} {context} "
+                f"first_mismatch_flat_index={first_mismatch_flat_index} "
+                f"old_value={old_scalar} new_value={new_scalar}"
+            )
+        logger.warning(
+            "Gemma4 compact paged KV oracle passed: %s",
+            context,
+        )
+
+    def _gather_paged_kv_to_dense_compact(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: AscendMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        self._validate_compact_paged_kv_cache(
+            key_cache,
+            value_cache,
+            attn_metadata,
+        )
+        compact = self._get_or_build_compact_paged_kv_metadata(
+            attn_metadata,
+            key_cache,
+        )
+        if _GEMMA4_MTP_DEBUG and compact.physical_slots.numel():
+            selected_block_ids = torch.div(
+                compact.physical_slots,
+                compact.block_size,
+                rounding_mode="floor",
+            )
+            self._log_paged_kv_gather_bounds(
+                key_cache,
+                value_cache,
+                attn_metadata.block_tables,
+                compact.block_table_snapshot,
+                selected_block_ids,
+                attn_metadata.seq_lens_list,
+            )
+
+        flat_key_cache = key_cache.view(
+            -1,
+            self.num_kv_heads,
+            self.head_size,
+        )
+        flat_value_cache = value_cache.view(
+            -1,
+            self.num_kv_heads,
+            self.head_size,
+        )
+        dense_key = flat_key_cache.index_select(0, compact.physical_slots)
+        dense_value = flat_value_cache.index_select(0, compact.physical_slots)
+
+        if _GEMMA4_MTP_ORACLE:
+            old_key, old_value = (
+                self._gather_paged_kv_snapshot_to_dense_reference(
+                    key_cache,
+                    value_cache,
+                    compact.block_table_snapshot,
+                    attn_metadata.seq_lens_list,
+                )
+            )
+            self._assert_compact_kv_oracle_equal(
+                dense_key,
+                dense_value,
+                old_key,
+                old_value,
+                compact,
+                attn_metadata,
+            )
+
+        return dense_key, dense_value, compact.actual_seq_lengths_kv
+
+    def _gather_paged_kv_to_dense_legacy(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: AscendMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        block_table = attn_metadata.block_tables
+        seq_lens = attn_metadata.seq_lens_list
+        block_size = key_cache.shape[1]
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.long, device=key_cache.device)
+        max_seq_len = int(seq_lens_tensor.max().item())
+        num_blocks = cdiv(max_seq_len, block_size)
+        # The runner reuses the source block-table buffer on subsequent
+        # scheduler steps. Keep an NPU-owned snapshot for the asynchronous
+        # gather so its indices cannot be mutated after this forward is queued.
+        block_table_snapshot = block_table[
+            : len(seq_lens),
+            :num_blocks,
+        ].long().clone().contiguous()
+        flat_block_ids = block_table_snapshot.reshape(-1)
+        self._log_paged_kv_gather_bounds(
+            key_cache,
+            value_cache,
+            block_table,
+            block_table_snapshot,
+            flat_block_ids,
+            seq_lens,
+        )
+        dense_key, dense_value = self._gather_paged_kv_snapshot_to_dense_reference(
+            key_cache,
+            value_cache,
+            block_table_snapshot,
+            seq_lens,
+        )
+        return dense_key, dense_value, list(itertools.accumulate(seq_lens))
 
     def _should_use_large_head_attention_fallback(self) -> bool:
         unsupported_fia_tnd_head_size = self.head_size not in FIA_TND_SUPPORTED_HEAD_SIZES
