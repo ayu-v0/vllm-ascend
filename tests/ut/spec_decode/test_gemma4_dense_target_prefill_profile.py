@@ -16,6 +16,8 @@ SCRIPT_DIR = (
 )
 PROFILE_RUNNER = SCRIPT_DIR / "profile_gemma4_dense_target_prefill.py"
 SUMMARIZER = SCRIPT_DIR / "summarize_gemma4_dense_target_prefill.py"
+PROFILE_SHELL = SCRIPT_DIR / "run_gemma4_dense_target_prefill_profile.sh"
+TTFT_SHELL = SCRIPT_DIR / "run_gemma4_dense_target_prefill_ttft.sh"
 
 
 def _load_module(path: Path, name: str):
@@ -498,6 +500,61 @@ class ProfileSummaryContractTests(unittest.TestCase):
             "## Evidence limitations",
         ):
             self.assertIn(heading, markdown)
+
+
+class ShellContractTests(unittest.TestCase):
+    def test_profile_shell_preserves_container_and_records_real_status(self):
+        source = PROFILE_SHELL.read_text(encoding="utf-8")
+        for token in (
+            "set +e",
+            "set -o pipefail",
+            "2>&1 | tee",
+            "PIPESTATUS[0]",
+            "profile run exit code:",
+            "profile analysis exit code:",
+            "trace_count=",
+            "exit 0",
+        ):
+            self.assertIn(token, source)
+        for case in (
+            "target compiled 8192",
+            "target compiled 16384",
+            "target compiled 28672",
+            "target eager 4096",
+            "mtp compiled 28672",
+        ):
+            self.assertIn(case, source)
+        for variable in (
+            "ASCEND_LAUNCH_BLOCKING",
+            "VLLM_ASCEND_GEMMA4_MTP_DEBUG",
+            "VLLM_ASCEND_GEMMA4_MTP_ORACLE",
+            "VLLM_ASCEND_GEMMA4_MTP_ASYNC_PROFILE",
+            "VLLM_ASCEND_GEMMA4_MTP_ASYNC_UNIPROC_SUBMIT",
+        ):
+            self.assertIn(variable, source)
+
+    def test_ttft_shell_fixes_long_prompt_matrix_and_cleans_server(self):
+        source = TTFT_SHELL.read_text(encoding="utf-8")
+        for token in (
+            "set +e",
+            "set -o pipefail",
+            "trap stop_server EXIT",
+            'MODES=("target" "mtp")',
+            "PROMPT_LENGTHS=(8192 16384 28672)",
+            "--random-output-len 1",
+            "--max-concurrency 1",
+            "--random-range-ratio",
+            "{\"input\":0.0,\"output\":0.0}",
+            "--no-async-scheduling",
+            "benchmark exit code:",
+            "PIPESTATUS[0]",
+            "exit 0",
+        ):
+            self.assertIn(token, source)
+        self.assertNotIn("--enable-prefix-caching", source)
+        self.assertIn("json.dumps", source)
+        self.assertIn("kill -INT", source)
+        self.assertIn("kill -TERM", source)
 
 
 if __name__ == "__main__":
