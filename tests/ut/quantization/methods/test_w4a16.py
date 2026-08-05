@@ -414,8 +414,21 @@ class TestAscendW4A16LinearMethod(TestBase):
         layer = Mock()
         layer.weight_packed_reference = object()
         layer.weight_scale_reference = object()
-        layer.weight_packed = object()
-        layer.weight_scale = object()
+        layer.weight_packed = torch.empty(
+            self.input_size,
+            self.output_size // self.quant_method.pack_factor,
+            dtype=torch.int32,
+        )
+        layer.weight_scale = torch.empty(
+            self.input_size // self.group_size,
+            self.output_size,
+            dtype=torch.bfloat16,
+        )
+        layer.prefix = "model.layers.0.mlp.gate_up_proj"
+        layer.w4a16_format_metadata = {
+            "reference_weight_format": 2,
+            "candidate_weight_format": 29,
+        }
         x = torch.empty(2, self.input_size, dtype=torch.bfloat16)
         reference = torch.empty(2, self.output_size, dtype=torch.bfloat16)
         candidate = torch.empty(2, self.output_size, dtype=torch.bfloat16)
@@ -435,6 +448,14 @@ class TestAscendW4A16LinearMethod(TestBase):
             equal_nan=False,
         )
         assert_async.assert_called_once()
+        message = assert_async.call_args.args[1]
+        self.assertIn(
+            "layer_prefix=model.layers.0.mlp.gate_up_proj",
+            message,
+        )
+        self.assertIn("weight=(128, 8)", message)
+        self.assertIn("reference_format=2", message)
+        self.assertIn("candidate_format=29", message)
 
     @patch("vllm_ascend.quantization.methods.w4a16.permute_param_layout_")
     @patch("vllm_ascend.quantization.methods.w4a16.torch_npu.npu_convert_weight_to_int4pack")
