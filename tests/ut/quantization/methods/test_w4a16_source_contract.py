@@ -67,6 +67,18 @@ class W4A16SourceContractTests(unittest.TestCase):
         )
         self.assertNotIn("maybe_trans_nz", branch_source)
 
+    def test_oracle_failure_message_attributes_layer_shape_and_formats(self):
+        source = W4A16.read_text(encoding="utf-8")
+        for token in (
+            "layer_prefix=",
+            "input=",
+            "weight=",
+            "reference_format=",
+            "candidate_format=",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, source)
+
 
 if __name__ == "__main__":
     unittest.main()

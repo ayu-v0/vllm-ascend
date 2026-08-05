@@ -13,12 +13,24 @@ SCRIPT = (
     / "spec_decode"
     / "summarize_gemma4_w4a16_prefill_gemm.py"
 )
+BENCHMARK = SCRIPT.with_name("benchmark_gemma4_w4a16_prefill_gemm.py")
 
 
 def _load_module():
     spec = importlib.util.spec_from_file_location(
         "gemma4_w4a16_prefill_gemm_summary",
         SCRIPT,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_benchmark():
+    spec = importlib.util.spec_from_file_location(
+        "gemma4_w4a16_prefill_gemm_benchmark",
+        BENCHMARK,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -166,6 +178,86 @@ class W4A16SummaryTests(unittest.TestCase):
         self.assertFalse(decision["accept_candidate"])
         self.assertFalse(decision["raw_count_matches"])
         self.assertGreater(decision["added_layout_overhead_ratio"], 0.01)
+
+
+class W4A16BenchmarkContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = _load_benchmark()
+
+    def test_builds_fixed_m_matrix_from_profile_shape(self):
+        summary = {
+            "reports": [
+                {
+                    "manifest": {"prompt_tokens": 28672},
+                    "shapes": [
+                        {
+                            "shape_id": "w4a16_shape_00",
+                            "input_shapes": (
+                                '"123,5376;5376,16384;42,16384"'
+                            ),
+                            "count": 60,
+                        }
+                    ],
+                }
+            ]
+        }
+
+        workloads = self.module.build_workloads(summary)
+
+        self.assertEqual(
+            [item["m"] for item in workloads],
+            [1, 123, 4096, 8192],
+        )
+        self.assertTrue(
+            all(item["k"] == 5376 and item["n"] == 16384 for item in workloads)
+        )
+        tail = next(item for item in workloads if item["is_profile_shape"])
+        self.assertEqual(tail["source_count"], 60)
+
+    def test_weighted_gate_uses_only_profile_shape_counts(self):
+        results = [
+            {
+                "reference_us": 100.0,
+                "candidate_us": 90.0,
+                "source_count": 60,
+                "is_profile_shape": True,
+                "passed": True,
+            },
+            {
+                "reference_us": 1000.0,
+                "candidate_us": 2000.0,
+                "source_count": 60,
+                "is_profile_shape": False,
+                "passed": True,
+            },
+        ]
+
+        summary = self.module.summarize_results(results)
+
+        self.assertEqual(summary["weighted_reference_us"], 6000.0)
+        self.assertEqual(summary["weighted_candidate_us"], 5400.0)
+        self.assertAlmostEqual(summary["weighted_improvement_percent"], 10.0)
+        self.assertTrue(summary["passed"])
+
+    def test_failed_operator_case_preserves_a_fail_closed_summary(self):
+        results = [
+            {
+                "shape_id": "shape-0",
+                "m": 8192,
+                "source_count": 60,
+                "is_profile_shape": True,
+                "passed": False,
+                "error": "RuntimeError: candidate format unsupported",
+            }
+        ]
+
+        summary = self.module.summarize_results(results)
+
+        self.assertFalse(summary["correctness_passed"])
+        self.assertFalse(summary["performance_gate_passed"])
+        self.assertFalse(summary["passed"])
+        self.assertIn("not proven inefficient", summary["conclusion"])
 
 
 if __name__ == "__main__":

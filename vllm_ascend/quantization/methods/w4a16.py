@@ -308,10 +308,18 @@ class AscendW4A16LinearMethod(AscendLinearScheme):
             rtol=_W4A16_ORACLE_RTOL,
             equal_nan=False,
         ).all()
+        format_metadata = getattr(layer, "w4a16_format_metadata", {})
+        layer_prefix = getattr(layer, "prefix", "unknown")
         torch._assert_async(
             close,
-            "W4A16 same-forward oracle mismatch for "
-            f"input={tuple(x.shape)} weight={tuple(layer.weight_packed.shape)}",
+            "W4A16 same-forward oracle mismatch: "
+            f"layer_prefix={layer_prefix} input={tuple(x.shape)} "
+            f"weight={tuple(layer.weight_packed.shape)} "
+            "reference_format="
+            f"{format_metadata.get('reference_weight_format')} "
+            "candidate_format="
+            f"{format_metadata.get('candidate_weight_format')} "
+            f"atol={_W4A16_ORACLE_ATOL} rtol={_W4A16_ORACLE_RTOL}",
         )
         return candidate
 
