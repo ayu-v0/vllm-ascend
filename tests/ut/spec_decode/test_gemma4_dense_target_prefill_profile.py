@@ -1,5 +1,8 @@
 import argparse
+import csv
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +15,7 @@ SCRIPT_DIR = (
     / "spec_decode"
 )
 PROFILE_RUNNER = SCRIPT_DIR / "profile_gemma4_dense_target_prefill.py"
+SUMMARIZER = SCRIPT_DIR / "summarize_gemma4_dense_target_prefill.py"
 
 
 def _load_module(path: Path, name: str):
@@ -169,6 +173,331 @@ class ProfileRunnerContractTests(unittest.TestCase):
             manifest["warmup_prompt_sha256"],
             manifest["profile_prompt_sha256"],
         )
+
+
+def _write_synthetic_profile(report_dir: Path) -> None:
+    report_dir.mkdir(parents=True)
+    with (report_dir / "op_statistic.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        fields = [
+            "Device_id",
+            "OP Type",
+            "Core Type",
+            "Count",
+            "Total Time(us)",
+            "Min Time(us)",
+            "Avg Time(us)",
+            "Max Time(us)",
+            "Ratio(%)",
+        ]
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for op_type, count, total_us in (
+            (
+                "WeightQuantBatchMatmulV2_bf16_int4_bf16_"
+                "high_performance_1",
+                2,
+                100,
+            ),
+            ("MatMulV2", 1, 50),
+            ("FlashAttentionScore", 1, 25),
+            ("RmsNorm", 1, 10),
+            ("Add", 1, 5),
+            ("Scatter", 1, 4),
+            ("aclnnGatherV3", 1, 3),
+            ("MysteryOp", 1, 3),
+        ):
+            writer.writerow(
+                {
+                    "Device_id": "0",
+                    "OP Type": op_type,
+                    "Core Type": "AI_CORE",
+                    "Count": str(count),
+                    "Total Time(us)": str(total_us),
+                    "Min Time(us)": "1",
+                    "Avg Time(us)": str(total_us / count),
+                    "Max Time(us)": str(total_us),
+                    "Ratio(%)": "0",
+                }
+            )
+
+    with (report_dir / "operator_details.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        fields = [
+            "Name",
+            "Input Shapes",
+            "Call Stack",
+            "Host Self Duration(us)",
+            "Host Total Duration(us)",
+            "Device Self Duration(us)",
+            "Device Total Duration(us)",
+            "Device Self Duration With AICore(us)",
+            "Device Total Duration With AICore(us)",
+        ]
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for name, host_us in (
+            ("prepare input", 10),
+            ("forward", 80),
+            ("post process", 5),
+            ("sample_token", 5),
+        ):
+            row = dict.fromkeys(fields, "0")
+            row["Name"] = name
+            row["Host Total Duration(us)"] = str(host_us)
+            writer.writerow(row)
+
+    with (report_dir / "kernel_details.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        fields = ["Name", "Type", "Duration(us)", "Wait Time(us)"]
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "Name": "weight_quant_kernel",
+                "Type": "WeightQuantBatchMatmulV2",
+                "Duration(us)": "80",
+                "Wait Time(us)": "7",
+            }
+        )
+        writer.writerow(
+            {
+                "Name": "flash_attention_kernel",
+                "Type": "FlashAttentionScore",
+                "Duration(us)": "20",
+                "Wait Time(us)": "3",
+            }
+        )
+
+
+def _write_profile_case(
+    profile_root: Path,
+    *,
+    mode: str,
+    execution: str,
+    prompt_tokens: int,
+) -> None:
+    case_dir = profile_root / f"{mode}_{execution}_{prompt_tokens}"
+    report_dir = case_dir / "profile" / "trace" / "ASCEND_PROFILER_OUTPUT"
+    _write_synthetic_profile(report_dir)
+    manifest = {
+        "workload": "gemma4_dense_target_prefill",
+        "mode": mode,
+        "execution": execution,
+        "target_model": "target",
+        "draft_model": "draft" if mode == "mtp" else None,
+        "tensor_parallel_size": 1,
+        "num_speculative_tokens": 3 if mode == "mtp" else 0,
+        "prompt_tokens": prompt_tokens,
+        "profile_prompt_sha256": f"{mode}-{execution}-{prompt_tokens}",
+        "offline_request_elapsed_ms": 100.0,
+        "engine": {"enable_prefix_caching": False},
+        "sampling": {"max_tokens": 1},
+        "profiler": {"delay_iterations": 0},
+    }
+    (case_dir / "manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+
+def _write_ttft_case(
+    ttft_root: Path,
+    *,
+    mode: str,
+    prompt_tokens: int,
+) -> None:
+    case_dir = ttft_root / mode / str(prompt_tokens)
+    case_dir.mkdir(parents=True)
+    result = {
+        "mode": mode,
+        "prompt_tokens": str(prompt_tokens),
+        "num_prompts": "10",
+        "completed": 10,
+        "failed": 0,
+        "request_throughput": 0.5,
+        "mean_ttft_ms": prompt_tokens / 10,
+        "median_ttft_ms": prompt_tokens / 11,
+        "p90_ttft_ms": prompt_tokens / 9,
+        "p99_ttft_ms": prompt_tokens / 8,
+    }
+    (case_dir / f"{mode}_{prompt_tokens}.json").write_text(
+        json.dumps(result),
+        encoding="utf-8",
+    )
+
+
+class ProfileSummaryContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = _load_module(SUMMARIZER, "gemma4_prefill_summary")
+
+    def test_classifies_suffixed_and_common_prefill_ops(self):
+        cases = {
+            "WeightQuantBatchMatmulV2_bf16_int4_bf16_1": (
+                "weight_quant_gemm"
+            ),
+            "MatMulV2": "dense_matmul",
+            "FlashAttentionScore": "attention",
+            "RmsNorm": "norm",
+            "Gelu": "activation_elementwise",
+            "Scatter": "kv_cache_update",
+            "aclnnGatherV3": "data_movement",
+            "MysteryOp": "other",
+        }
+        for op_type, expected in cases.items():
+            with self.subTest(op_type=op_type):
+                self.assertEqual(
+                    self.module.classify_op_type(op_type),
+                    expected,
+                )
+
+    def test_analyzes_synthetic_profile_and_host_phases(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir) / "ASCEND_PROFILER_OUTPUT"
+            _write_synthetic_profile(report_dir)
+            result = self.module.analyze_profile(
+                report_dir,
+                {"prompt_tokens": 100, "mode": "target", "execution": "compiled"},
+            )
+
+        self.assertEqual(result["total_device_us"], 200)
+        self.assertEqual(
+            result["categories"]["weight_quant_gemm"]["total_device_us"],
+            100,
+        )
+        self.assertAlmostEqual(
+            sum(
+                category["ratio_of_profile_device_time"]
+                for category in result["categories"].values()
+            ),
+            1.0,
+        )
+        self.assertTrue(
+            result["top_raw_ops"][0]["op_type"].startswith(
+                "WeightQuantBatchMatmulV2_"
+            )
+        )
+        self.assertEqual(
+            result["top_raw_ops"][0]["normalized_op_type"],
+            "WeightQuantBatchMatmulV2",
+        )
+        self.assertEqual(result["kernel_wait_us"], 10)
+        self.assertEqual(result["host_phases"]["prepare input"], 10)
+        self.assertAlmostEqual(result["host_prepare_ratio"], 0.1)
+
+    def test_rejects_incomparable_manifests(self):
+        base = {
+            "target_model": "target",
+            "draft_model": None,
+            "mode": "target",
+            "execution": "compiled",
+            "tensor_parallel_size": 1,
+            "num_speculative_tokens": 0,
+            "prompt_tokens": 8192,
+            "profile_prompt_sha256": "abc",
+            "engine": {"enable_prefix_caching": False},
+            "sampling": {"max_tokens": 1},
+            "profiler": {"delay_iterations": 0},
+        }
+        changed = {**base, "prompt_tokens": 16384}
+        with self.assertRaisesRegex(ValueError, "prompt_tokens"):
+            self.module.validate_comparable_manifests([base, changed])
+
+    def test_reads_successful_ttft_result_and_rejects_failures(self):
+        result = {
+            "mode": "target",
+            "prompt_tokens": "8192",
+            "completed": 10,
+            "failed": 0,
+            "request_throughput": 0.5,
+            "mean_ttft_ms": 100.0,
+            "median_ttft_ms": 90.0,
+            "p90_ttft_ms": 120.0,
+            "p99_ttft_ms": 140.0,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "result.json"
+            path.write_text(json.dumps(result), encoding="utf-8")
+            parsed = self.module.read_ttft_result(path)
+            self.assertEqual(parsed["prompt_tokens"], 8192)
+
+            path.write_text(
+                json.dumps({**result, "completed": 9, "failed": 1}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "failed"):
+                self.module.read_ttft_result(path)
+
+    def test_decision_prefers_host_then_largest_device_category(self):
+        categories = {
+            "weight_quant_gemm": {"ratio_of_profile_device_time": 0.5},
+            "attention": {"ratio_of_profile_device_time": 0.2},
+        }
+        host = self.module.select_decision(
+            {"host_prepare_ratio": 0.16, "categories": categories}
+        )
+        device = self.module.select_decision(
+            {"host_prepare_ratio": 0.1, "categories": categories}
+        )
+
+        self.assertEqual(host["primary_hotspot"], "host_prepare")
+        self.assertEqual(device["primary_hotspot"], "weight_quant_gemm")
+        self.assertEqual(
+            device["next_plan_filename"],
+            "gemma4-ascend-w4a16-prefill-gemm-optimization-development-plan.md",
+        )
+
+    def test_builds_complete_summary_and_markdown_from_fixed_matrix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile_root = root / "profiles"
+            ttft_root = root / "ttft"
+            for mode, execution, prompt_tokens in (
+                ("target", "compiled", 8192),
+                ("target", "compiled", 16384),
+                ("target", "compiled", 28672),
+                ("target", "eager", 4096),
+                ("mtp", "compiled", 28672),
+            ):
+                _write_profile_case(
+                    profile_root,
+                    mode=mode,
+                    execution=execution,
+                    prompt_tokens=prompt_tokens,
+                )
+            for mode in ("target", "mtp"):
+                for prompt_tokens in (8192, 16384, 28672):
+                    _write_ttft_case(
+                        ttft_root,
+                        mode=mode,
+                        prompt_tokens=prompt_tokens,
+                    )
+
+            summary = self.module.build_summary(profile_root, ttft_root)
+            markdown = self.module.render_markdown(summary)
+
+        self.assertEqual(len(summary["profiles"]), 5)
+        self.assertEqual(len(summary["ttft_results"]), 6)
+        self.assertEqual(
+            summary["decision"]["primary_hotspot"],
+            "weight_quant_gemm",
+        )
+        self.assertIn("8192_to_28672_total_device_ratio", summary["scaling"])
+        for heading in (
+            "## Workload contract",
+            "## TTFT baseline",
+            "## Compiled profile",
+            "## Eager attribution",
+            "## Target versus MTP",
+            "## Scaling",
+            "## Decision",
+            "## Evidence limitations",
+        ):
+            self.assertIn(heading, markdown)
 
 
 if __name__ == "__main__":
