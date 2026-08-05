@@ -3,6 +3,7 @@
 
 set +e
 set -o pipefail
+export ASCEND_RT_VISIBLE_DEVICES=0
 
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 <code-root> <run-set-dir>" >&2

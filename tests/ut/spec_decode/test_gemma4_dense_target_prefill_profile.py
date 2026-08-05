@@ -505,6 +505,7 @@ class ProfileSummaryContractTests(unittest.TestCase):
 class ShellContractTests(unittest.TestCase):
     def test_profile_shell_preserves_container_and_records_real_status(self):
         source = PROFILE_SHELL.read_text(encoding="utf-8")
+        self.assertIn("export ASCEND_RT_VISIBLE_DEVICES=0", source)
         for token in (
             "set +e",
             "set -o pipefail",
@@ -535,6 +536,7 @@ class ShellContractTests(unittest.TestCase):
 
     def test_ttft_shell_fixes_long_prompt_matrix_and_cleans_server(self):
         source = TTFT_SHELL.read_text(encoding="utf-8")
+        self.assertIn("export ASCEND_RT_VISIBLE_DEVICES=0", source)
         for token in (
             "set +e",
             "set -o pipefail",
@@ -546,6 +548,7 @@ class ShellContractTests(unittest.TestCase):
             "--random-range-ratio",
             "{\"input\":0.0,\"output\":0.0}",
             "--no-async-scheduling",
+            "--no-enable-prefix-caching",
             "benchmark exit code:",
             "PIPESTATUS[0]",
             "exit 0",
@@ -555,6 +558,18 @@ class ShellContractTests(unittest.TestCase):
         self.assertIn("json.dumps", source)
         self.assertIn("kill -INT", source)
         self.assertIn("kill -TERM", source)
+
+    def test_ttft_manifest_records_reproducibility_contract(self):
+        source = TTFT_SHELL.read_text(encoding="utf-8")
+        for token in (
+            '"repo_sha"',
+            '"server_commands"',
+            '"benchmark_commands"',
+            '"case_results"',
+            "server-command.txt",
+            "client-command.txt",
+        ):
+            self.assertIn(token, source)
 
 
 if __name__ == "__main__":

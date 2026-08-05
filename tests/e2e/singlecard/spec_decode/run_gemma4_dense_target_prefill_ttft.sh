@@ -3,6 +3,7 @@
 
 set +e
 set -o pipefail
+export ASCEND_RT_VISIBLE_DEVICES=0
 
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 <code-root> <run-set-dir>" >&2
@@ -72,6 +73,43 @@ wait_for_health() {
   return 1
 }
 
+build_benchmark_args() {
+  BENCH_ARGS=(
+    vllm bench serve
+    --backend openai
+    --base-url "http://127.0.0.1:$PORT"
+    --endpoint /v1/completions
+    --model "$SERVED_MODEL_NAME"
+    --tokenizer "$TARGET_MODEL"
+    --dataset-name random
+    --random-input-len "$PROMPT_TOKENS"
+    --random-output-len 1
+    --random-range-ratio '{"input":0.0,"output":0.0}'
+    --num-prompts "$NUM_PROMPTS"
+    --num-warmups "$NUM_WARMUPS"
+    --request-rate inf
+    --max-concurrency 1
+    --seed 0
+    --disable-shuffle
+    --disable-tqdm
+    --ignore-eos
+    --temperature 0
+    --percentile-metrics ttft,e2el
+    --metric-percentiles 50,90,99
+    --save-result
+    --save-detailed
+    --result-dir "$CASE_DIR"
+    --result-filename "$RESULT_FILE"
+    --request-id-prefix "$MODE-$PROMPT_TOKENS-"
+    --metadata
+      "mode=$MODE"
+      "prompt_tokens=$PROMPT_TOKENS"
+      "num_prompts=$NUM_PROMPTS"
+      "max_concurrency=1"
+      "output_tokens=1"
+  )
+}
+
 trap stop_server EXIT
 
 ENVIRONMENT_RC=0
@@ -106,6 +144,13 @@ if [[ $IMPORT_RC -ne 0 || "$IMPORT_PATH" != "$CODE_ROOT"/* ]]; then
   ENVIRONMENT_RC=2
 fi
 
+REPO_SHA=$(git -C "$CODE_ROOT" rev-parse HEAD 2>/dev/null)
+REPO_SHA_RC=$?
+if [[ $REPO_SHA_RC -ne 0 || -z "$REPO_SHA" ]]; then
+  echo "Unable to resolve repo SHA from $CODE_ROOT." >&2
+  ENVIRONMENT_RC=2
+fi
+
 if curl --fail --silent "http://127.0.0.1:$PORT/health" >/dev/null; then
   echo "Benchmark port $PORT already has a healthy service." >&2
   ENVIRONMENT_RC=2
@@ -115,6 +160,7 @@ if [[ $ENVIRONMENT_RC -ne 0 ]]; then
   {
     echo "environment_exit_code=$ENVIRONMENT_RC"
     echo "import_path=$IMPORT_PATH"
+    echo "repo_sha=$REPO_SHA"
   } >"$RUN_SET_DIR/matrix-status.txt"
   exit 0
 fi
@@ -141,6 +187,7 @@ for MODE in "${MODES[@]}"; do
     --seed 0
     --trust-remote-code
     --enable-chunked-prefill
+    --no-enable-prefix-caching
     --language-model-only
     --no-async-scheduling
   )
@@ -179,60 +226,39 @@ PY
   wait_for_health "$SERVER_LOG"
   HEALTH_RC=$?
   echo "server health exit code: $HEALTH_RC" | tee "$SERVER_STATUS"
-  if [[ $HEALTH_RC -ne 0 ]]; then
-    FAILED_CASES=$((FAILED_CASES + ${#PROMPT_LENGTHS[@]}))
-    stop_server
-    continue
-  fi
 
   for PROMPT_TOKENS in "${PROMPT_LENGTHS[@]}"; do
     CASE_DIR="$MODE_DIR/$PROMPT_TOKENS"
     RESULT_FILE="${MODE}_${PROMPT_TOKENS}.json"
     CLIENT_LOG="$CASE_DIR/client.log"
+    CLIENT_COMMAND="$CASE_DIR/client-command.txt"
     STATUS_FILE="$CASE_DIR/status.txt"
     mkdir -p "$CASE_DIR"
 
-    vllm bench serve \
-      --backend openai \
-      --base-url "http://127.0.0.1:$PORT" \
-      --endpoint /v1/completions \
-      --model "$SERVED_MODEL_NAME" \
-      --tokenizer "$TARGET_MODEL" \
-      --dataset-name random \
-      --random-input-len "$PROMPT_TOKENS" \
-      --random-output-len 1 \
-      --random-range-ratio '{"input":0.0,"output":0.0}' \
-      --num-prompts "$NUM_PROMPTS" \
-      --num-warmups "$NUM_WARMUPS" \
-      --request-rate inf \
-      --max-concurrency 1 \
-      --seed 0 \
-      --disable-shuffle \
-      --disable-tqdm \
-      --ignore-eos \
-      --temperature 0 \
-      --percentile-metrics ttft,e2el \
-      --metric-percentiles 50,90,99 \
-      --save-result \
-      --save-detailed \
-      --result-dir "$CASE_DIR" \
-      --result-filename "$RESULT_FILE" \
-      --request-id-prefix "$MODE-$PROMPT_TOKENS-" \
-      --metadata \
-        "mode=$MODE" \
-        "prompt_tokens=$PROMPT_TOKENS" \
-        "num_prompts=$NUM_PROMPTS" \
-        "max_concurrency=1" \
-        "output_tokens=1" \
-      2>&1 | tee "$CLIENT_LOG"
-    BENCH_RC=${PIPESTATUS[0]}
+    build_benchmark_args
+    printf 'PYTHONPATH=%q ' "$CODE_ROOT:${PYTHONPATH:-}" \
+      >"$CLIENT_COMMAND"
+    printf '%q ' "${BENCH_ARGS[@]}" >>"$CLIENT_COMMAND"
+    printf '\n' >>"$CLIENT_COMMAND"
+
+    if [[ $HEALTH_RC -eq 0 ]]; then
+      PYTHONPATH="$CODE_ROOT:${PYTHONPATH:-}" \
+        "${BENCH_ARGS[@]}" 2>&1 | tee "$CLIENT_LOG"
+      BENCH_RC=${PIPESTATUS[0]}
+    else
+      BENCH_RC=125
+      echo "benchmark skipped because server health failed: $HEALTH_RC" |
+        tee "$CLIENT_LOG"
+    fi
     echo "benchmark exit code: $BENCH_RC" | tee -a "$CLIENT_LOG"
     {
       echo "mode=$MODE"
       echo "prompt_tokens=$PROMPT_TOKENS"
+      echo "server_health_exit_code=$HEALTH_RC"
       echo "benchmark_exit_code=$BENCH_RC"
       echo "result_file=$CASE_DIR/$RESULT_FILE"
       echo "client_log=$CLIENT_LOG"
+      echo "client_command=$CLIENT_COMMAND"
     } >"$STATUS_FILE"
     if [[ $BENCH_RC -ne 0 ]]; then
       FAILED_CASES=$((FAILED_CASES + 1))
@@ -241,31 +267,85 @@ PY
   stop_server
 done
 
-python - "$RUN_SET_DIR/manifest.json" "$CODE_ROOT" "$IMPORT_PATH" \
-  "$TARGET_MODEL" "$DRAFT_MODEL" "$NUM_PROMPTS" \
-  "$NUM_WARMUPS" "$FAILED_CASES" <<'PY'
+python - "$RUN_SET_DIR/manifest.json" "$RUN_SET_DIR" "$CODE_ROOT" \
+  "$REPO_SHA" "$IMPORT_PATH" "$TARGET_MODEL" "$DRAFT_MODEL" \
+  "$NUM_PROMPTS" "$NUM_WARMUPS" "$FAILED_CASES" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 output = Path(sys.argv[1])
+run_set_dir = Path(sys.argv[2])
+repo_sha = sys.argv[4]
+server_commands = {}
+benchmark_commands = {}
+case_results = []
+for mode in ("target", "mtp"):
+    server_command_path = run_set_dir / mode / "server-command.txt"
+    server_commands[mode] = (
+        server_command_path.read_text(encoding="utf-8").strip()
+        if server_command_path.is_file()
+        else None
+    )
+    for prompt_tokens in (8192, 16384, 28672):
+        case_dir = run_set_dir / mode / str(prompt_tokens)
+        command_path = case_dir / "client-command.txt"
+        status_path = case_dir / "status.txt"
+        case_key = f"{mode}_{prompt_tokens}"
+        benchmark_commands[case_key] = (
+            command_path.read_text(encoding="utf-8").strip()
+            if command_path.is_file()
+            else None
+        )
+        status = {}
+        if status_path.is_file():
+            for line in status_path.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if separator:
+                    status[key] = value
+        benchmark_exit_code = status.get("benchmark_exit_code")
+        server_health_exit_code = status.get("server_health_exit_code")
+        case_results.append(
+            {
+                "mode": mode,
+                "prompt_tokens": prompt_tokens,
+                "server_health_exit_code": (
+                    int(server_health_exit_code)
+                    if server_health_exit_code is not None
+                    else None
+                ),
+                "benchmark_exit_code": (
+                    int(benchmark_exit_code)
+                    if benchmark_exit_code is not None
+                    else None
+                ),
+                "result_file": status.get("result_file"),
+                "client_log": status.get("client_log"),
+                "client_command": status.get("client_command"),
+            }
+        )
 payload = {
     "workload": "gemma4_dense_target_prefill_ttft",
-    "code_root": sys.argv[2],
-    "import_path": sys.argv[3],
-    "target_model": sys.argv[4],
-    "draft_model": sys.argv[5],
+    "code_root": sys.argv[3],
+    "repo_sha": repo_sha,
+    "import_path": sys.argv[5],
+    "target_model": sys.argv[6],
+    "draft_model": sys.argv[7],
     "modes": ["target", "mtp"],
     "prompt_tokens": [8192, 16384, 28672],
-    "num_prompts": int(sys.argv[6]),
-    "num_warmups": int(sys.argv[7]),
+    "num_prompts": int(sys.argv[8]),
+    "num_warmups": int(sys.argv[9]),
     "max_concurrency": 1,
     "output_tokens": 1,
     "max_model_len": 32768,
     "max_num_batched_tokens": 8192,
     "prefix_caching": False,
     "async_scheduling": False,
-    "failed_cases": int(sys.argv[8]),
+    "ascend_rt_visible_devices": "0",
+    "server_commands": server_commands,
+    "benchmark_commands": benchmark_commands,
+    "case_results": case_results,
+    "failed_cases": int(sys.argv[10]),
 }
 output.write_text(
     json.dumps(payload, indent=2, sort_keys=True),
