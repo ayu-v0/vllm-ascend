@@ -165,11 +165,15 @@ class ProfileRunnerContractTests(unittest.TestCase):
             offline_request_elapsed_ms=12.5,
             engine_args={"enable_prefix_caching": False},
             profiler_kwargs={"delay_iterations": 0},
+            w4a16_linear_impl="reference",
+            vllm_ascend_enable_nz=1,
         )
 
         self.assertEqual(manifest["workload"], "gemma4_dense_target_prefill")
         self.assertEqual(manifest["generated_token_count"], 1)
         self.assertEqual(manifest["offline_request_elapsed_ms"], 12.5)
+        self.assertEqual(manifest["w4a16_linear_impl"], "reference")
+        self.assertEqual(manifest["vllm_ascend_enable_nz"], 1)
         self.assertNotIn("ttft", manifest)
         self.assertNotEqual(
             manifest["warmup_prompt_sha256"],
@@ -409,6 +413,28 @@ class ProfileSummaryContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prompt_tokens"):
             self.module.validate_comparable_manifests([base, changed])
 
+    def test_ab_manifests_allow_impl_change_but_require_same_nz_mode(self):
+        base = {
+            "target_model": "target",
+            "mode": "target",
+            "execution": "compiled",
+            "w4a16_linear_impl": "reference",
+            "vllm_ascend_enable_nz": 1,
+        }
+        candidate = {
+            **base,
+            "w4a16_linear_impl": "candidate",
+        }
+        self.module.validate_comparable_manifests([base, candidate])
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "vllm_ascend_enable_nz",
+        ):
+            self.module.validate_comparable_manifests(
+                [base, {**candidate, "vllm_ascend_enable_nz": 2}]
+            )
+
     def test_reads_successful_ttft_result_and_rejects_failures(self):
         result = {
             "mode": "target",
@@ -566,6 +592,10 @@ class ShellContractTests(unittest.TestCase):
             '"server_commands"',
             '"benchmark_commands"',
             '"case_results"',
+            '"w4a16_linear_impl"',
+            '"vllm_ascend_enable_nz"',
+            "W4A16_LINEAR_IMPL",
+            "VLLM_ASCEND_ENABLE_NZ",
             "server-command.txt",
             "client-command.txt",
         ):

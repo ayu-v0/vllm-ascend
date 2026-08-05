@@ -19,6 +19,8 @@ GPU_MEMORY_UTILIZATION=${GEMMA4_PREFILL_TTFT_GPU_MEMORY_UTILIZATION:-0.92}
 NUM_PROMPTS=${GEMMA4_PREFILL_TTFT_NUM_PROMPTS:-10}
 NUM_WARMUPS=${GEMMA4_PREFILL_TTFT_NUM_WARMUPS:-1}
 SERVER_LOG_LEVEL=${GEMMA4_PREFILL_TTFT_LOG_LEVEL:-WARNING}
+W4A16_LINEAR_IMPL=${VLLM_ASCEND_W4A16_LINEAR_IMPL:-reference}
+W4A16_ENABLE_NZ=${VLLM_ASCEND_ENABLE_NZ:-1}
 SERVED_MODEL_NAME=gemma4-prefill
 MODES=("target" "mtp")
 PROMPT_LENGTHS=(8192 16384 28672)
@@ -131,6 +133,18 @@ if [[ -z "$TARGET_MODEL" || -z "$DRAFT_MODEL" ]]; then
   ENVIRONMENT_RC=2
 fi
 
+if [[ "$W4A16_LINEAR_IMPL" != "reference" && \
+      "$W4A16_LINEAR_IMPL" != "candidate" && \
+      "$W4A16_LINEAR_IMPL" != "oracle" ]]; then
+  echo "Unsupported VLLM_ASCEND_W4A16_LINEAR_IMPL: $W4A16_LINEAR_IMPL" >&2
+  ENVIRONMENT_RC=2
+fi
+if [[ "$W4A16_ENABLE_NZ" != "0" && "$W4A16_ENABLE_NZ" != "1" && \
+      "$W4A16_ENABLE_NZ" != "2" ]]; then
+  echo "Unsupported VLLM_ASCEND_ENABLE_NZ: $W4A16_ENABLE_NZ" >&2
+  ENVIRONMENT_RC=2
+fi
+
 IMPORT_OUTPUT=$(
   PYTHONPATH="$CODE_ROOT:${PYTHONPATH:-}" python -c \
     'import pathlib, vllm_ascend; print(pathlib.Path(vllm_ascend.__file__).resolve())' \
@@ -211,6 +225,8 @@ PY
   printf 'PYTHONPATH=%q VLLM_LOGGING_LEVEL=%q ' \
     "$CODE_ROOT:${PYTHONPATH:-}" "$SERVER_LOG_LEVEL" \
     >"$SERVER_COMMAND"
+  printf 'VLLM_ASCEND_W4A16_LINEAR_IMPL=%q VLLM_ASCEND_ENABLE_NZ=%q ' \
+    "$W4A16_LINEAR_IMPL" "$W4A16_ENABLE_NZ" >>"$SERVER_COMMAND"
   printf '%q ' "${SERVER_ARGS[@]}" >>"$SERVER_COMMAND"
   printf '\n' >>"$SERVER_COMMAND"
 
@@ -219,6 +235,8 @@ PY
   SERVER_LOG_TAIL_PID=$!
   PYTHONPATH="$CODE_ROOT:${PYTHONPATH:-}" \
     VLLM_LOGGING_LEVEL="$SERVER_LOG_LEVEL" \
+    VLLM_ASCEND_W4A16_LINEAR_IMPL="$W4A16_LINEAR_IMPL" \
+    VLLM_ASCEND_ENABLE_NZ="$W4A16_ENABLE_NZ" \
     "${SERVER_ARGS[@]}" >"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   echo "server pid: $SERVER_PID"
@@ -269,7 +287,8 @@ done
 
 python - "$RUN_SET_DIR/manifest.json" "$RUN_SET_DIR" "$CODE_ROOT" \
   "$REPO_SHA" "$IMPORT_PATH" "$TARGET_MODEL" "$DRAFT_MODEL" \
-  "$NUM_PROMPTS" "$NUM_WARMUPS" "$FAILED_CASES" <<'PY'
+  "$NUM_PROMPTS" "$NUM_WARMUPS" "$FAILED_CASES" \
+  "$W4A16_LINEAR_IMPL" "$W4A16_ENABLE_NZ" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -342,6 +361,8 @@ payload = {
     "prefix_caching": False,
     "async_scheduling": False,
     "ascend_rt_visible_devices": "0",
+    "w4a16_linear_impl": sys.argv[11],
+    "vllm_ascend_enable_nz": int(sys.argv[12]),
     "server_commands": server_commands,
     "benchmark_commands": benchmark_commands,
     "case_results": case_results,

@@ -183,6 +183,8 @@ def build_manifest(
     offline_request_elapsed_ms: float,
     engine_args: dict[str, object],
     profiler_kwargs: dict[str, object],
+    w4a16_linear_impl: str,
+    vllm_ascend_enable_nz: int,
 ) -> dict[str, object]:
     return {
         "workload": "gemma4_dense_target_prefill",
@@ -203,6 +205,8 @@ def build_manifest(
         "output_token_ids": output_token_ids,
         "offline_request_elapsed_ms": offline_request_elapsed_ms,
         "profile_dir": str(profile_dir),
+        "w4a16_linear_impl": w4a16_linear_impl,
+        "vllm_ascend_enable_nz": vllm_ascend_enable_nz,
         "engine": engine_args,
         "sampling": {
             "temperature": 0,
@@ -257,6 +261,10 @@ def main() -> None:
     import vllm_ascend
     from vllm import LLM, SamplingParams
     from vllm.config import ProfilerConfig
+    from vllm_ascend import envs
+
+    w4a16_linear_impl = envs.VLLM_ASCEND_W4A16_LINEAR_IMPL
+    vllm_ascend_enable_nz = envs.VLLM_ASCEND_ENABLE_NZ
 
     profiler_kwargs = build_profiler_kwargs(
         execution=args.execution,
@@ -268,6 +276,8 @@ def main() -> None:
     print(f"Mode: {args.mode}", flush=True)
     print(f"Execution: {args.execution}", flush=True)
     print(f"Prompt tokens: {args.prompt_tokens}", flush=True)
+    print(f"W4A16 linear implementation: {w4a16_linear_impl}", flush=True)
+    print(f"VLLM_ASCEND_ENABLE_NZ: {vllm_ascend_enable_nz}", flush=True)
     print(f"Profile directory: {profile_dir}", flush=True)
 
     llm = LLM(**engine_args)
@@ -337,6 +347,8 @@ def main() -> None:
         offline_request_elapsed_ms=elapsed_ms,
         engine_args=build_engine_manifest(args),
         profiler_kwargs=profiler_kwargs,
+        w4a16_linear_impl=w4a16_linear_impl,
+        vllm_ascend_enable_nz=vllm_ascend_enable_nz,
     )
     manifest_out.write_text(
         json.dumps(manifest, indent=2, sort_keys=True),

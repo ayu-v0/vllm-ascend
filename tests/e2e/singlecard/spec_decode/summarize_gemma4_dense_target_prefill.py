@@ -34,6 +34,7 @@ COMPARABLE_MANIFEST_FIELDS = (
     "num_speculative_tokens",
     "prompt_tokens",
     "profile_prompt_sha256",
+    "vllm_ascend_enable_nz",
     "engine",
     "sampling",
     "profiler",
