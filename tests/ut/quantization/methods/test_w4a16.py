@@ -1,9 +1,11 @@
+import os
 from unittest.mock import Mock, patch
 
 import regex as re
 import torch
 
 from tests.ut.base import TestBase
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.quantization.methods.w4a16 import (
     AscendW4A16FusedMoEMethod,
@@ -192,6 +194,43 @@ class TestAscendW4A16LinearMethod(TestBase):
 
         self.quant_method = AscendW4A16LinearMethod()
 
+    def _make_linear_layer(self):
+        layer = torch.nn.Module()
+        layer.weight_packed = torch.nn.Parameter(
+            torch.tensor([[0x76543210]], dtype=torch.int32),
+            requires_grad=False,
+        )
+        layer.weight_shape = torch.nn.Parameter(
+            torch.tensor([1, 6], dtype=torch.int64),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.tensor([[0.25]], dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        return layer
+
+    def test_w4a16_linear_impl_defaults_to_reference(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                envs.VLLM_ASCEND_W4A16_LINEAR_IMPL,
+                "reference",
+            )
+
+    @patch("vllm_ascend.quantization.methods.w4a16.get_current_vllm_config")
+    def test_w4a16_linear_rejects_unknown_impl(
+        self,
+        mock_get_current_vllm_config,
+    ):
+        mock_get_current_vllm_config.return_value.quant_config.quant_description = {
+            "group_size": self.group_size,
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            "candidate, oracle, reference",
+        ):
+            AscendW4A16LinearMethod(linear_impl="unknown")
+
     def test_get_weight(self):
         param_dict = self.quant_method.get_weight(self.input_size, self.output_size, torch.bfloat16)
 
@@ -250,6 +289,152 @@ class TestAscendW4A16LinearMethod(TestBase):
         self.assertNotIn("antiquant_offset", kwargs)
         self.assertEqual(kwargs["antiquant_group_size"], self.group_size)
         self.assertIs(kwargs["bias"], bias)
+
+    @patch("vllm_ascend.quantization.methods.w4a16.torch_npu.npu_weight_quant_batchmatmul")
+    def test_reference_apply_preserves_current_operator_contract(self, op):
+        layer = Mock()
+        layer.weight_packed = object()
+        layer.weight_scale = Mock()
+        runtime_scale = object()
+        layer.weight_scale.to.return_value = runtime_scale
+        x = torch.empty(2, self.input_size, dtype=torch.bfloat16)
+        bias = torch.empty(self.output_size, dtype=torch.bfloat16)
+        output = object()
+        op.return_value = output
+
+        result = self.quant_method._apply_reference(layer, x, bias)
+
+        self.assertIs(result, output)
+        layer.weight_scale.to.assert_called_once_with(x.dtype)
+        op.assert_called_once_with(
+            x=x,
+            weight=layer.weight_packed,
+            antiquant_scale=runtime_scale,
+            antiquant_group_size=self.group_size,
+            bias=bias,
+        )
+
+    @patch("vllm_ascend.quantization.methods.w4a16.torch_npu.npu_weight_quant_batchmatmul")
+    def test_candidate_apply_uses_runtime_weight_and_scale_without_to(self, op):
+        method = self.quant_method
+        method.linear_impl = "candidate"
+        layer = Mock()
+        layer.weight_packed = object()
+        layer.weight_scale = torch.empty(
+            self.input_size // self.group_size,
+            self.output_size,
+            dtype=torch.bfloat16,
+        )
+        x = torch.empty(2, self.input_size, dtype=torch.bfloat16)
+        output = object()
+        op.return_value = output
+
+        result = method._apply_candidate(layer, x, None)
+
+        self.assertIs(result, output)
+        op.assert_called_once_with(
+            x=x,
+            weight=layer.weight_packed,
+            antiquant_scale=layer.weight_scale,
+            antiquant_group_size=self.group_size,
+            bias=None,
+        )
+
+    def test_candidate_apply_rejects_non_runtime_ready_scale(self):
+        method = self.quant_method
+        method.linear_impl = "candidate"
+        layer = Mock()
+        layer.weight_packed = object()
+        layer.weight_scale = torch.empty(
+            self.output_size,
+            self.input_size // self.group_size,
+            dtype=torch.float32,
+        ).transpose(0, 1)
+        x = torch.empty(2, self.input_size, dtype=torch.bfloat16)
+
+        with self.assertRaisesRegex(RuntimeError, "not runtime-ready"):
+            method._apply_candidate(layer, x, None)
+
+    @patch("vllm_ascend.quantization.methods.w4a16.maybe_trans_nz")
+    @patch("vllm_ascend.quantization.methods.w4a16.permute_param_layout_")
+    @patch("vllm_ascend.quantization.methods.w4a16.torch_npu.npu_convert_weight_to_int4pack")
+    def test_reference_mode_never_constructs_candidate_weight(
+        self,
+        convert_weight,
+        _permute_param_layout,
+        maybe_trans_nz,
+    ):
+        convert_weight.return_value = torch.zeros((6, 1), dtype=torch.int32)
+        layer = self._make_linear_layer()
+
+        self.quant_method.process_weights_after_loading(layer)
+
+        maybe_trans_nz.assert_not_called()
+        self.assertFalse(hasattr(layer, "weight_packed_reference"))
+        self.assertIsNone(
+            layer.w4a16_format_metadata["candidate_weight_format"]
+        )
+
+    @patch("vllm_ascend.quantization.methods.w4a16.maybe_trans_nz")
+    @patch("vllm_ascend.quantization.methods.w4a16.permute_param_layout_")
+    @patch("vllm_ascend.quantization.methods.w4a16.torch_npu.npu_convert_weight_to_int4pack")
+    def test_candidate_mode_constructs_only_runtime_weight(
+        self,
+        convert_weight,
+        _permute_param_layout,
+        maybe_trans_nz,
+    ):
+        method = self.quant_method
+        method.linear_impl = "candidate"
+        reference_weight = torch.zeros((6, 1), dtype=torch.int32)
+        candidate_weight = torch.ones((6, 1), dtype=torch.int32)
+        convert_weight.return_value = reference_weight
+        maybe_trans_nz.return_value = candidate_weight
+        layer = self._make_linear_layer()
+
+        method.process_weights_after_loading(layer)
+
+        maybe_trans_nz.assert_called_once_with(reference_weight)
+        self.assertTrue(torch.equal(layer.weight_packed.data, candidate_weight))
+        self.assertFalse(hasattr(layer, "weight_packed_reference"))
+
+    @patch("vllm_ascend.quantization.methods.w4a16.torch._assert_async")
+    @patch("vllm_ascend.quantization.methods.w4a16.torch.isclose")
+    @patch("vllm_ascend.quantization.methods.w4a16._apply_w4a16_candidate")
+    @patch("vllm_ascend.quantization.methods.w4a16._apply_w4a16_reference")
+    def test_oracle_checks_same_forward_and_returns_candidate(
+        self,
+        apply_reference,
+        apply_candidate,
+        isclose,
+        assert_async,
+    ):
+        method = self.quant_method
+        method.linear_impl = "oracle"
+        layer = Mock()
+        layer.weight_packed_reference = object()
+        layer.weight_scale_reference = object()
+        layer.weight_packed = object()
+        layer.weight_scale = object()
+        x = torch.empty(2, self.input_size, dtype=torch.bfloat16)
+        reference = torch.empty(2, self.output_size, dtype=torch.bfloat16)
+        candidate = torch.empty(2, self.output_size, dtype=torch.bfloat16)
+        close = Mock()
+        apply_reference.return_value = reference
+        apply_candidate.return_value = candidate
+        isclose.return_value.all.return_value = close
+
+        result = method._apply_oracle(layer, x, None)
+
+        self.assertIs(result, candidate)
+        isclose.assert_called_once_with(
+            reference,
+            candidate,
+            atol=2e-2,
+            rtol=2e-2,
+            equal_nan=False,
+        )
+        assert_async.assert_called_once()
 
     @patch("vllm_ascend.quantization.methods.w4a16.permute_param_layout_")
     @patch("vllm_ascend.quantization.methods.w4a16.torch_npu.npu_convert_weight_to_int4pack")

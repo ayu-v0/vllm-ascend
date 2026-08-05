@@ -22,15 +22,67 @@ from typing import Any
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.logger import logger
 from vllm.model_executor.parameter import permute_param_layout_
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.utils import maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
+
+
+_VALID_W4A16_LINEAR_IMPLS = frozenset({"reference", "candidate", "oracle"})
+_W4A16_ORACLE_ATOL = 2e-2
+_W4A16_ORACLE_RTOL = 2e-2
+
+
+def _apply_w4a16_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    return torch_npu.npu_weight_quant_batchmatmul(
+        x=x,
+        weight=weight,
+        antiquant_scale=scale.to(x.dtype),
+        antiquant_group_size=group_size,
+        bias=bias,
+    )
+
+
+def _apply_w4a16_candidate(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    if scale.dtype != x.dtype or not scale.is_contiguous():
+        raise RuntimeError("W4A16 candidate scale is not runtime-ready")
+    return torch_npu.npu_weight_quant_batchmatmul(
+        x=x,
+        weight=weight,
+        antiquant_scale=scale,
+        antiquant_group_size=group_size,
+        bias=bias,
+    )
+
+
+def _get_npu_format(tensor: torch.Tensor) -> int | None:
+    get_format = getattr(torch_npu, "get_npu_format", None)
+    if get_format is None:
+        return None
+    try:
+        return int(get_format(tensor))
+    except RuntimeError:
+        return None
 
 
 def unpack_from_int32(
@@ -137,13 +189,21 @@ class AscendW4A16LinearMethod(AscendLinearScheme):
 
     quant_type: QuantType = QuantType.W4A16
 
-    def __init__(self) -> None:
+    def __init__(self, linear_impl: str | None = None) -> None:
         self.num_bits = 4
         self.pack_factor = 8
 
         vllm_config = get_current_vllm_config()
         self.group_size = vllm_config.quant_config.quant_description.get("group_size", 128)
-        assert self.group_size > 0, "W4A16 linear requires positive group_size."
+        if self.group_size <= 0:
+            raise ValueError("W4A16 linear requires a positive group_size")
+        self.linear_impl = envs.VLLM_ASCEND_W4A16_LINEAR_IMPL if linear_impl is None else linear_impl
+        if self.linear_impl not in _VALID_W4A16_LINEAR_IMPLS:
+            choices = ", ".join(sorted(_VALID_W4A16_LINEAR_IMPLS))
+            raise ValueError(
+                f"Unsupported W4A16 linear impl {self.linear_impl!r}; expected one of: {choices}"
+            )
+        logger.info_once("W4A16 linear implementation: %s", self.linear_impl)
 
     def get_weight(
         self,
@@ -187,13 +247,73 @@ class AscendW4A16LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        return torch_npu.npu_weight_quant_batchmatmul(
-            x=x,
-            weight=layer.weight_packed,
-            antiquant_scale=layer.weight_scale.to(x.dtype),
-            antiquant_group_size=self.group_size,
-            bias=bias,
+        if self.linear_impl == "reference":
+            return self._apply_reference(layer, x, bias)
+        if self.linear_impl == "candidate":
+            return self._apply_candidate(layer, x, bias)
+        return self._apply_oracle(layer, x, bias)
+
+    def _apply_reference(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _apply_w4a16_reference(
+            x,
+            layer.weight_packed,
+            layer.weight_scale,
+            self.group_size,
+            bias,
         )
+
+    def _apply_candidate(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _apply_w4a16_candidate(
+            x,
+            layer.weight_packed,
+            layer.weight_scale,
+            self.group_size,
+            bias,
+        )
+
+    def _apply_oracle(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        reference = _apply_w4a16_reference(
+            x,
+            layer.weight_packed_reference,
+            layer.weight_scale_reference,
+            self.group_size,
+            bias,
+        )
+        candidate = _apply_w4a16_candidate(
+            x,
+            layer.weight_packed,
+            layer.weight_scale,
+            self.group_size,
+            bias,
+        )
+        close = torch.isclose(
+            reference,
+            candidate,
+            atol=_W4A16_ORACLE_ATOL,
+            rtol=_W4A16_ORACLE_RTOL,
+            equal_nan=False,
+        ).all()
+        torch._assert_async(
+            close,
+            "W4A16 same-forward oracle mismatch for "
+            f"input={tuple(x.shape)} weight={tuple(layer.weight_packed.shape)}",
+        )
+        return candidate
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         permute_param_layout_(layer.weight_packed, input_dim=1, output_dim=0, packed_dim=1)
@@ -212,8 +332,38 @@ class AscendW4A16LinearMethod(AscendLinearScheme):
             signed=True,
         )
         transposed_weight = unpacked_weight.transpose(0, 1).contiguous().to(torch.int32)
-        layer.weight_packed.data = torch_npu.npu_convert_weight_to_int4pack(transposed_weight)
-        layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1).contiguous()
+        reference_weight = torch_npu.npu_convert_weight_to_int4pack(transposed_weight)
+        runtime_scale = layer.weight_scale.data.transpose(0, 1).contiguous().to(dtype=layer.weight_scale.dtype)
+
+        reference_weight_format = _get_npu_format(reference_weight)
+        if self.linear_impl == "reference":
+            layer.weight_packed.data = reference_weight
+            layer.weight_scale.data = runtime_scale
+            candidate_weight_format = None
+        elif self.linear_impl == "candidate":
+            layer.weight_packed.data = maybe_trans_nz(reference_weight)
+            layer.weight_scale.data = runtime_scale
+            candidate_weight_format = _get_npu_format(layer.weight_packed)
+        else:
+            layer.weight_packed_reference = torch.nn.Parameter(reference_weight, requires_grad=False)
+            layer.weight_scale_reference = torch.nn.Parameter(runtime_scale, requires_grad=False)
+            layer.weight_packed.data = maybe_trans_nz(reference_weight.clone())
+            layer.weight_scale.data = runtime_scale.clone()
+            candidate_weight_format = _get_npu_format(layer.weight_packed)
+
+        scale_format = _get_npu_format(layer.weight_scale)
+        layer.w4a16_format_metadata = {
+            "w4a16_linear_impl": self.linear_impl,
+            "reference_weight_format": reference_weight_format,
+            "candidate_weight_format": candidate_weight_format,
+            "format_changed": (
+                candidate_weight_format is not None
+                and candidate_weight_format != reference_weight_format
+            ),
+            "scale_format": scale_format,
+            "scale_dtype": str(layer.weight_scale.dtype),
+            "group_size": self.group_size,
+        }
 
 
 @register_scheme("W4A16", "moe")

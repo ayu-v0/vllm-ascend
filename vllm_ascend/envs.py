@@ -90,6 +90,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 1: only quant case enable nz;
     # 2: enable nz as long as possible.
     "VLLM_ASCEND_ENABLE_NZ": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_NZ", 1)),
+    # Select the dense W4A16 linear runtime implementation. This is not
+    # sensitive and is read when the quantization method is constructed.
+    # reference: exact pre-optimization int4pack path.
+    # candidate: NZ weight/runtime-ready scale experiment.
+    # oracle: execute both paths on the same input and return candidate output.
+    "VLLM_ASCEND_W4A16_LINEAR_IMPL": lambda: os.getenv("VLLM_ASCEND_W4A16_LINEAR_IMPL", "reference"),
     # Decide whether we should enable CP parallelism.
     "VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL", "0"))),
     # Whether to anbale dynamic EPLB
