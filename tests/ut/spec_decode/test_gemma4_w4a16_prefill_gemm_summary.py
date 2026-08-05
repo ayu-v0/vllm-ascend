@@ -190,6 +190,9 @@ class W4A16SummaryTests(unittest.TestCase):
                     "target_model": "target",
                     "vllm_ascend_enable_nz": 1,
                     "w4a16_linear_impl": impl,
+                    "offline_request_elapsed_ms": (
+                        100.0 if impl == "reference" else 90.0
+                    ),
                 },
                 "total_device_us": total_us,
                 "weighted_w4a16_us": w4a16_us,

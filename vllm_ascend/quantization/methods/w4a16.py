@@ -30,7 +30,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
-from vllm_ascend.utils import maybe_trans_nz
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -39,6 +39,20 @@ from .registry import register_scheme
 _VALID_W4A16_LINEAR_IMPLS = frozenset({"reference", "candidate", "oracle"})
 _W4A16_ORACLE_ATOL = 2e-2
 _W4A16_ORACLE_RTOL = 2e-2
+
+
+def _prepare_w4a16_candidate_weight(
+    weight: torch.Tensor,
+    *,
+    nz_mode: int | None = None,
+) -> torch.Tensor:
+    if nz_mode is None:
+        return maybe_trans_nz(weight)
+    if nz_mode not in {0, 1, 2}:
+        raise ValueError(f"Unsupported W4A16 candidate NZ mode: {nz_mode}")
+    if nz_mode == 0:
+        return weight
+    return torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ)
 
 
 def _apply_w4a16_reference(
@@ -349,13 +363,17 @@ class AscendW4A16LinearMethod(AscendLinearScheme):
             layer.weight_scale.data = runtime_scale
             candidate_weight_format = None
         elif self.linear_impl == "candidate":
-            layer.weight_packed.data = maybe_trans_nz(reference_weight)
+            layer.weight_packed.data = _prepare_w4a16_candidate_weight(
+                reference_weight
+            )
             layer.weight_scale.data = runtime_scale
             candidate_weight_format = _get_npu_format(layer.weight_packed)
         else:
             layer.weight_packed_reference = torch.nn.Parameter(reference_weight, requires_grad=False)
             layer.weight_scale_reference = torch.nn.Parameter(runtime_scale, requires_grad=False)
-            layer.weight_packed.data = maybe_trans_nz(reference_weight.clone())
+            layer.weight_packed.data = _prepare_w4a16_candidate_weight(
+                reference_weight.clone()
+            )
             layer.weight_scale.data = runtime_scale.clone()
             candidate_weight_format = _get_npu_format(layer.weight_packed)
 
@@ -372,6 +390,15 @@ class AscendW4A16LinearMethod(AscendLinearScheme):
             "scale_dtype": str(layer.weight_scale.dtype),
             "group_size": self.group_size,
         }
+        logger.info_once(
+            "W4A16 runtime formats: impl=%s reference_weight_format=%s "
+            "candidate_weight_format=%s scale_format=%s scale_dtype=%s",
+            self.linear_impl,
+            reference_weight_format,
+            candidate_weight_format,
+            scale_format,
+            layer.weight_scale.dtype,
+        )
 
 
 @register_scheme("W4A16", "moe")

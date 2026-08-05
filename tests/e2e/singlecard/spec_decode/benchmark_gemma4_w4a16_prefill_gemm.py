@@ -264,8 +264,8 @@ def run_benchmark(
     from vllm_ascend.quantization.methods.w4a16 import (
         _apply_w4a16_candidate,
         _apply_w4a16_reference,
+        _prepare_w4a16_candidate_weight,
     )
-    from vllm_ascend.utils import maybe_trans_nz
 
     torch.manual_seed(seed)
     torch.npu.manual_seed_all(seed)
@@ -299,7 +299,10 @@ def run_benchmark(
         reference_weight = torch_npu.npu_convert_weight_to_int4pack(
             unpacked_weight
         )
-        candidate_weight = maybe_trans_nz(reference_weight.clone())
+        candidate_weight = _prepare_w4a16_candidate_weight(
+            reference_weight.clone(),
+            nz_mode=int(os.environ.get("VLLM_ASCEND_ENABLE_NZ", "1")),
+        )
         scale = torch.rand(
             (k // group_size, n),
             dtype=torch.bfloat16,

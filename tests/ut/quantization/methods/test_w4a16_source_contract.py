@@ -6,6 +6,14 @@ from pathlib import Path
 ROOT = Path(__file__).parents[4]
 W4A16 = ROOT / "vllm_ascend" / "quantization" / "methods" / "w4a16.py"
 ENVS = ROOT / "vllm_ascend" / "envs.py"
+BENCHMARK = (
+    ROOT
+    / "tests"
+    / "e2e"
+    / "singlecard"
+    / "spec_decode"
+    / "benchmark_gemma4_w4a16_prefill_gemm.py"
+)
 
 
 class W4A16SourceContractTests(unittest.TestCase):
@@ -78,6 +86,13 @@ class W4A16SourceContractTests(unittest.TestCase):
         ):
             with self.subTest(token=token):
                 self.assertIn(token, source)
+
+    def test_standalone_benchmark_does_not_require_initialized_ascend_config(self):
+        w4a16_source = W4A16.read_text(encoding="utf-8")
+        benchmark_source = BENCHMARK.read_text(encoding="utf-8")
+        self.assertIn("def _prepare_w4a16_candidate_weight", w4a16_source)
+        self.assertIn("nz_mode=", benchmark_source)
+        self.assertNotIn("maybe_trans_nz(reference_weight", benchmark_source)
 
 
 if __name__ == "__main__":

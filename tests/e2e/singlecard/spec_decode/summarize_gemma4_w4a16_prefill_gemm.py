@@ -13,15 +13,25 @@ WEIGHT_QUANT_OP = "WeightQuantBatchMatmulV2"
 LAYOUT_OVERHEAD_OPS = ("Cast", "TransData", "Contiguous")
 REQUIRED_IMPROVEMENT_PERCENT = 8.0
 MAX_ADDED_LAYOUT_OVERHEAD_RATIO = 0.01
-AB_MANIFEST_IGNORED_FIELDS = frozenset(
-    {
-        "w4a16_linear_impl",
-        "repo_sha",
-        "created_at",
-        "profile_dir",
-        "result_file",
-        "result_paths",
-    }
+AB_COMPARABLE_MANIFEST_FIELDS = (
+    "workload",
+    "mode",
+    "execution",
+    "repo_root",
+    "vllm_ascend_file",
+    "target_model",
+    "draft_model",
+    "tensor_parallel_size",
+    "num_speculative_tokens",
+    "prompt_tokens",
+    "warmup_prompt_sha256",
+    "profile_prompt_sha256",
+    "generated_token_count",
+    "output_token_ids",
+    "vllm_ascend_enable_nz",
+    "engine",
+    "sampling",
+    "profiler",
 )
 
 
@@ -284,12 +294,9 @@ def _validate_ab_manifests(
     reference: dict[str, object],
     candidate: dict[str, object],
 ) -> None:
-    fields = (
-        set(reference) | set(candidate)
-    ) - AB_MANIFEST_IGNORED_FIELDS
     mismatches = sorted(
         field
-        for field in fields
+        for field in AB_COMPARABLE_MANIFEST_FIELDS
         if reference.get(field) != candidate.get(field)
     )
     if mismatches:
@@ -386,6 +393,11 @@ def build_ab_comparison(
             cand,
             oracle_passed=oracle_passed,
         )
+        all_shape_counts_match = (
+            bool(shapes)
+            and bool(decision["raw_count_matches"])
+            and all(bool(shape["count_matches"]) for shape in shapes)
+        )
         cases.append(
             {
                 "mode": key[0],
@@ -396,9 +408,7 @@ def build_ab_comparison(
                 ),
                 "w4a16": decision,
                 "shapes": shapes,
-                "all_shape_counts_match": all(
-                    bool(shape["count_matches"]) for shape in shapes
-                ),
+                "all_shape_counts_match": all_shape_counts_match,
                 "reference_layout_overhead_ops": ref.get(
                     "layout_overhead_ops", {}
                 ),
@@ -482,7 +492,11 @@ def build_summary(profile_root: Path) -> dict[str, object]:
         for report_dir in _find_report_dirs(profile_root)
     ]
     scaling = {
-        str(report["manifest"].get("prompt_tokens")): report[
+        "{}_{}_{}".format(
+            report["manifest"].get("mode", "unknown"),
+            report["manifest"].get("execution", "unknown"),
+            report["manifest"].get("prompt_tokens"),
+        ): report[
             "weighted_w4a16_us_per_token"
         ]
         for report in reports
@@ -492,7 +506,7 @@ def build_summary(profile_root: Path) -> dict[str, object]:
     return {
         "profile_root": str(profile_root.resolve()),
         "reports": reports,
-        "per_token_device_us_by_prompt_tokens": scaling,
+        "per_token_device_us_by_case": scaling,
     }
 
 
