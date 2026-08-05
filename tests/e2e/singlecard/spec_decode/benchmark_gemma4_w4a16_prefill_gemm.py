@@ -267,6 +267,9 @@ def run_benchmark(
         _prepare_w4a16_candidate_weight,
     )
 
+    # Match the production model-runner initialization before creating or
+    # casting the candidate weight to an internal format such as FRACTAL_NZ.
+    torch.npu.config.allow_internal_format = True
     torch.manual_seed(seed)
     torch.npu.manual_seed_all(seed)
     sorted_workloads = sorted(
@@ -338,6 +341,7 @@ def run_benchmark(
             results.append(result)
             print(json.dumps(result, sort_keys=True), flush=True)
             case_index += 1
+            torch.npu.empty_cache()
         del unpacked_weight, reference_weight, candidate_weight, scale
         torch.npu.empty_cache()
     return results

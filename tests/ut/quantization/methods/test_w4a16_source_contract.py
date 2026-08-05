@@ -94,6 +94,18 @@ class W4A16SourceContractTests(unittest.TestCase):
         self.assertIn("nz_mode=", benchmark_source)
         self.assertNotIn("maybe_trans_nz(reference_weight", benchmark_source)
 
+    def test_benchmark_matches_runtime_internal_format_and_releases_cases(self):
+        source = BENCHMARK.read_text(encoding="utf-8")
+        enable_internal_format = (
+            "torch.npu.config.allow_internal_format = True"
+        )
+        self.assertIn(enable_internal_format, source)
+        self.assertLess(
+            source.index(enable_internal_format),
+            source.index("_prepare_w4a16_candidate_weight("),
+        )
+        self.assertGreaterEqual(source.count("torch.npu.empty_cache()"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
