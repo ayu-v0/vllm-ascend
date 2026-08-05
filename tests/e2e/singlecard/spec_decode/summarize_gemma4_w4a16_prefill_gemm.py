@@ -13,6 +13,16 @@ WEIGHT_QUANT_OP = "WeightQuantBatchMatmulV2"
 LAYOUT_OVERHEAD_OPS = ("Cast", "TransData", "Contiguous")
 REQUIRED_IMPROVEMENT_PERCENT = 8.0
 MAX_ADDED_LAYOUT_OVERHEAD_RATIO = 0.01
+AB_MANIFEST_IGNORED_FIELDS = frozenset(
+    {
+        "w4a16_linear_impl",
+        "repo_sha",
+        "created_at",
+        "profile_dir",
+        "result_file",
+        "result_paths",
+    }
+)
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -48,6 +58,41 @@ def _is_layout_overhead_op(op_type: str) -> bool:
     return any(normalized.startswith(name) for name in LAYOUT_OVERHEAD_OPS)
 
 
+def _group_top_raw_kernels(
+    kernel_rows: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str, str, str, str], list[float]] = {}
+    for row in kernel_rows:
+        key = (
+            row.get("Name", ""),
+            row.get("Type", ""),
+            row.get("Input Shapes", ""),
+            row.get("Input Formats", ""),
+            row.get("Output Shapes", ""),
+        )
+        grouped.setdefault(key, []).append(_number(row, "Duration(us)"))
+    result = []
+    for key, durations in grouped.items():
+        total_us = sum(durations)
+        result.append(
+            {
+                "name": key[0],
+                "type": key[1],
+                "input_shapes": key[2],
+                "input_formats": key[3],
+                "output_shapes": key[4],
+                "count": len(durations),
+                "total_us": total_us,
+                "avg_us": total_us / len(durations),
+            }
+        )
+    return sorted(
+        result,
+        key=lambda item: float(item["total_us"]),
+        reverse=True,
+    )[:30]
+
+
 def analyze_w4a16_report(
     report_dir: Path,
     manifest: dict[str, object],
@@ -73,6 +118,19 @@ def analyze_w4a16_report(
         for row in op_rows
         if _is_layout_overhead_op(row.get("OP Type", ""))
     )
+    layout_overhead_ops = {}
+    for op_name in LAYOUT_OVERHEAD_OPS:
+        rows = [
+            row
+            for row in op_rows
+            if row.get("OP Type", "").strip().startswith(op_name)
+        ]
+        layout_overhead_ops[op_name] = {
+            "count": sum(int(_number(row, "Count")) for row in rows),
+            "total_us": sum(
+                _number(row, "Total Time(us)") for row in rows
+            ),
+        }
 
     grouped: dict[tuple[str, str, str, str], dict[str, object]] = {}
     for row in kernel_rows:
@@ -135,6 +193,7 @@ def analyze_w4a16_report(
         "weighted_w4a16_us": weighted_w4a16_us,
         "raw_w4a16_count": raw_w4a16_count,
         "layout_overhead_us": layout_overhead_us,
+        "layout_overhead_ops": layout_overhead_ops,
         "weight_quant_ratio": (
             total_w4a16_us / total_device_us if total_device_us else 0.0
         ),
@@ -142,6 +201,7 @@ def analyze_w4a16_report(
             weighted_w4a16_us / prompt_tokens if prompt_tokens else None
         ),
         "shapes": shapes,
+        "top_raw_kernels": _group_top_raw_kernels(kernel_rows),
     }
 
 
@@ -199,6 +259,197 @@ def select_candidate(
             and overhead_passed
             and improvement >= REQUIRED_IMPROVEMENT_PERCENT
         ),
+    }
+
+
+def _profile_key(report: dict[str, object]) -> tuple[str, str, int]:
+    manifest = report["manifest"]
+    return (
+        str(manifest.get("mode")),
+        str(manifest.get("execution")),
+        int(manifest.get("prompt_tokens", 0)),
+    )
+
+
+def _shape_key(shape: dict[str, object]) -> tuple[str, str, str, str]:
+    return (
+        str(shape.get("input_shapes", "")),
+        str(shape.get("input_dtypes", "")),
+        str(shape.get("input_formats", "")),
+        str(shape.get("output_shapes", "")),
+    )
+
+
+def _validate_ab_manifests(
+    reference: dict[str, object],
+    candidate: dict[str, object],
+) -> None:
+    fields = (
+        set(reference) | set(candidate)
+    ) - AB_MANIFEST_IGNORED_FIELDS
+    mismatches = sorted(
+        field
+        for field in fields
+        if reference.get(field) != candidate.get(field)
+    )
+    if mismatches:
+        raise ValueError(
+            "Profiler manifests are not comparable: "
+            + ", ".join(mismatches)
+        )
+
+
+def _compare_shapes(
+    reference: dict[str, object],
+    candidate: dict[str, object],
+) -> list[dict[str, object]]:
+    reference_shapes = {
+        _shape_key(shape): shape for shape in reference.get("shapes", [])
+    }
+    candidate_shapes = {
+        _shape_key(shape): shape for shape in candidate.get("shapes", [])
+    }
+    rows = []
+    for key in sorted(set(reference_shapes) | set(candidate_shapes)):
+        ref = reference_shapes.get(key, {})
+        cand = candidate_shapes.get(key, {})
+        reference_us = float(ref.get("total_us", 0.0))
+        candidate_us = float(cand.get("total_us", 0.0))
+        improvement = (
+            (1.0 - candidate_us / reference_us) * 100.0
+            if reference_us > 0
+            else None
+        )
+        reference_count = int(ref.get("count", 0))
+        candidate_count = int(cand.get("count", 0))
+        rows.append(
+            {
+                "input_shapes": key[0],
+                "input_dtypes": key[1],
+                "input_formats": key[2],
+                "output_shapes": key[3],
+                "count": reference_count,
+                "reference_count": reference_count,
+                "candidate_count": candidate_count,
+                "count_matches": reference_count == candidate_count,
+                "reference_total_us": reference_us,
+                "candidate_total_us": candidate_us,
+                "reference_avg_us": float(ref.get("avg_us", 0.0)),
+                "candidate_avg_us": float(cand.get("avg_us", 0.0)),
+                "improvement_percent": improvement,
+            }
+        )
+    return rows
+
+
+def _total_device_improvement(
+    reference: dict[str, object],
+    candidate: dict[str, object],
+) -> float:
+    reference_us = float(reference["total_device_us"])
+    if reference_us <= 0:
+        raise ValueError("reference total_device_us must be positive")
+    return (
+        1.0 - float(candidate["total_device_us"]) / reference_us
+    ) * 100.0
+
+
+def build_ab_comparison(
+    reference: dict[str, object],
+    candidate: dict[str, object],
+    *,
+    oracle_passed: bool,
+) -> dict[str, object]:
+    reference_reports = {
+        _profile_key(report): report for report in reference["reports"]
+    }
+    candidate_reports = {
+        _profile_key(report): report for report in candidate["reports"]
+    }
+    if set(reference_reports) != set(candidate_reports):
+        missing_reference = sorted(set(candidate_reports) - set(reference_reports))
+        missing_candidate = sorted(set(reference_reports) - set(candidate_reports))
+        raise ValueError(
+            "Profiler case sets differ: "
+            f"missing_reference={missing_reference} "
+            f"missing_candidate={missing_candidate}"
+        )
+
+    cases = []
+    for key in sorted(reference_reports):
+        ref = reference_reports[key]
+        cand = candidate_reports[key]
+        _validate_ab_manifests(ref["manifest"], cand["manifest"])
+        shapes = _compare_shapes(ref, cand)
+        decision = select_candidate(
+            ref,
+            cand,
+            oracle_passed=oracle_passed,
+        )
+        cases.append(
+            {
+                "mode": key[0],
+                "execution": key[1],
+                "prompt_tokens": key[2],
+                "total_device_improvement_percent": (
+                    _total_device_improvement(ref, cand)
+                ),
+                "w4a16": decision,
+                "shapes": shapes,
+                "all_shape_counts_match": all(
+                    bool(shape["count_matches"]) for shape in shapes
+                ),
+                "reference_layout_overhead_ops": ref.get(
+                    "layout_overhead_ops", {}
+                ),
+                "candidate_layout_overhead_ops": cand.get(
+                    "layout_overhead_ops", {}
+                ),
+                "reference_top_raw_kernels": ref.get(
+                    "top_raw_kernels", []
+                ),
+                "candidate_top_raw_kernels": cand.get(
+                    "top_raw_kernels", []
+                ),
+            }
+        )
+
+    case_index = {
+        (case["mode"], case["execution"], case["prompt_tokens"]): case
+        for case in cases
+    }
+    target_28k = case_index.get(("target", "compiled", 28672))
+    target_8k = case_index.get(("target", "compiled", 8192))
+    gates = {
+        "oracle_passed": oracle_passed,
+        "all_shape_counts_match": all(
+            bool(case["all_shape_counts_match"]) for case in cases
+        ),
+        "target_28k_w4a16_gain": (
+            target_28k is not None
+            and float(target_28k["w4a16"]["improvement_percent"])
+            >= REQUIRED_IMPROVEMENT_PERCENT
+        ),
+        "target_28k_total_device_gain": (
+            target_28k is not None
+            and float(target_28k["total_device_improvement_percent"]) > 0
+        ),
+        "target_8k_total_regression": (
+            target_8k is not None
+            and float(target_8k["total_device_improvement_percent"]) >= -2.0
+        ),
+        "layout_overhead": all(
+            float(case["w4a16"]["added_layout_overhead_ratio"])
+            <= MAX_ADDED_LAYOUT_OVERHEAD_RATIO
+            for case in cases
+        ),
+    }
+    return {
+        "reference_profile_root": reference.get("profile_root"),
+        "candidate_profile_root": candidate.get("profile_root"),
+        "cases": cases,
+        "gates": gates,
+        "accept_candidate": all(gates.values()),
     }
 
 
@@ -270,9 +521,70 @@ def render_markdown(summary: dict[str, object]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_ab_markdown(comparison: dict[str, object]) -> str:
+    lines = [
+        "# Gemma4 W4A16 prefill GEMM A/B",
+        "",
+        f"Candidate accepted: `{comparison['accept_candidate']}`",
+        "",
+        "## Gates",
+        "",
+    ]
+    for name, passed in comparison["gates"].items():
+        lines.append(f"- `{name}`: `{passed}`")
+    lines.extend(
+        [
+            "",
+            "## Profile cases",
+            "",
+            "| Mode | Execution | Prompt | W4A16 gain % | Total gain % | Shape counts |",
+            "|---|---|---:|---:|---:|---|",
+        ]
+    )
+    for case in comparison["cases"]:
+        lines.append(
+            "| {mode} | {execution} | {prompt} | {w4:.3f} | "
+            "{total:.3f} | {counts} |".format(
+                mode=case["mode"],
+                execution=case["execution"],
+                prompt=case["prompt_tokens"],
+                w4=float(case["w4a16"]["improvement_percent"]),
+                total=float(case["total_device_improvement_percent"]),
+                counts=case["all_shape_counts_match"],
+            )
+        )
+        lines.extend(
+            [
+                "",
+                f"### {case['mode']} {case['execution']} {case['prompt_tokens']}",
+                "",
+                "| Input shapes | Ref count | Cand count | Ref total us | Cand total us | Gain % |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for shape in case["shapes"]:
+            gain = shape["improvement_percent"]
+            gain_text = "n/a" if gain is None else f"{float(gain):.3f}"
+            lines.append(
+                "| `{inputs}` | {ref_count} | {cand_count} | "
+                "{ref_us:.3f} | {cand_us:.3f} | {gain} |".format(
+                    inputs=shape["input_shapes"],
+                    ref_count=shape["reference_count"],
+                    cand_count=shape["candidate_count"],
+                    ref_us=float(shape["reference_total_us"]),
+                    cand_us=float(shape["candidate_total_us"]),
+                    gain=gain_text,
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile-root", type=Path, required=True)
+    parser.add_argument("--profile-root", type=Path)
+    parser.add_argument("--reference-root", type=Path)
+    parser.add_argument("--candidate-root", type=Path)
+    parser.add_argument("--oracle-passed", action="store_true")
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-markdown", type=Path, required=True)
     return parser.parse_args()
@@ -280,16 +592,36 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    summary = build_summary(args.profile_root)
+    is_ab = args.reference_root is not None or args.candidate_root is not None
+    if is_ab:
+        if args.reference_root is None or args.candidate_root is None:
+            raise ValueError(
+                "--reference-root and --candidate-root must be used together"
+            )
+        summary = build_ab_comparison(
+            build_summary(args.reference_root),
+            build_summary(args.candidate_root),
+            oracle_passed=args.oracle_passed,
+        )
+        markdown = render_ab_markdown(summary)
+    else:
+        if args.profile_root is None:
+            raise ValueError(
+                "--profile-root or both A/B profile roots are required"
+            )
+        summary = build_summary(args.profile_root)
+        markdown = render_markdown(summary)
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(
         json.dumps(summary, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    args.output_markdown.write_text(render_markdown(summary), encoding="utf-8")
+    args.output_markdown.write_text(markdown, encoding="utf-8")
     print(f"Wrote JSON summary: {args.output_json}", flush=True)
     print(f"Wrote Markdown summary: {args.output_markdown}", flush=True)
+    if is_ab:
+        return 0 if summary["accept_candidate"] else 1
     return 0
 
 

@@ -14,6 +14,7 @@ SCRIPT = (
     / "summarize_gemma4_w4a16_prefill_gemm.py"
 )
 BENCHMARK = SCRIPT.with_name("benchmark_gemma4_w4a16_prefill_gemm.py")
+AB_SHELL = SCRIPT.with_name("run_gemma4_w4a16_prefill_gemm_ab.sh")
 
 
 def _load_module():
@@ -179,6 +180,94 @@ class W4A16SummaryTests(unittest.TestCase):
         self.assertFalse(decision["raw_count_matches"])
         self.assertGreater(decision["added_layout_overhead_ratio"], 0.01)
 
+    def test_ab_summary_compares_shapes_and_applies_profile_gates(self):
+        def report(prompt_tokens, total_us, w4a16_us, impl):
+            return {
+                "manifest": {
+                    "mode": "target",
+                    "execution": "compiled",
+                    "prompt_tokens": prompt_tokens,
+                    "target_model": "target",
+                    "vllm_ascend_enable_nz": 1,
+                    "w4a16_linear_impl": impl,
+                },
+                "total_device_us": total_us,
+                "weighted_w4a16_us": w4a16_us,
+                "raw_w4a16_count": 10,
+                "layout_overhead_us": 0.0,
+                "layout_overhead_ops": {},
+                "top_raw_kernels": [],
+                "shapes": [
+                    {
+                        "input_shapes": "8192,5376;5376,16384;42,16384",
+                        "input_dtypes": "DT_BF16;DT_INT4;DT_BF16",
+                        "input_formats": "ND;ND;ND",
+                        "output_shapes": "8192,16384",
+                        "count": 10,
+                        "total_us": w4a16_us,
+                        "avg_us": w4a16_us / 10,
+                    }
+                ],
+            }
+
+        reference = {
+            "reports": [
+                report(8192, 100.0, 50.0, "reference"),
+                report(28672, 1000.0, 500.0, "reference"),
+            ]
+        }
+        candidate = {
+            "reports": [
+                report(8192, 101.0, 45.0, "candidate"),
+                report(28672, 950.0, 450.0, "candidate"),
+            ]
+        }
+
+        result = self.module.build_ab_comparison(
+            reference,
+            candidate,
+            oracle_passed=True,
+        )
+
+        self.assertTrue(result["gates"]["all_shape_counts_match"])
+        self.assertTrue(result["gates"]["target_28k_w4a16_gain"])
+        self.assertTrue(result["gates"]["target_28k_total_device_gain"])
+        self.assertTrue(result["gates"]["target_8k_total_regression"])
+        self.assertTrue(result["accept_candidate"])
+        self.assertEqual(result["cases"][1]["shapes"][0]["count"], 10)
+
+    def test_ab_summary_rejects_incomparable_nz_mode(self):
+        base_report = {
+            "manifest": {
+                "mode": "target",
+                "execution": "compiled",
+                "prompt_tokens": 28672,
+                "target_model": "target",
+                "vllm_ascend_enable_nz": 1,
+            },
+            "total_device_us": 100.0,
+            "weighted_w4a16_us": 50.0,
+            "raw_w4a16_count": 1,
+            "layout_overhead_us": 0.0,
+            "layout_overhead_ops": {},
+            "top_raw_kernels": [],
+            "shapes": [],
+        }
+        changed = {
+            **base_report,
+            "manifest": {
+                **base_report["manifest"],
+                "vllm_ascend_enable_nz": 2,
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "vllm_ascend_enable_nz"):
+            self.module.build_ab_comparison(
+                {"reports": [base_report]},
+                {"reports": [changed]},
+                oracle_passed=True,
+            )
+
 
 class W4A16BenchmarkContractTests(unittest.TestCase):
     @classmethod
@@ -258,6 +347,31 @@ class W4A16BenchmarkContractTests(unittest.TestCase):
         self.assertFalse(summary["performance_gate_passed"])
         self.assertFalse(summary["passed"])
         self.assertIn("not proven inefficient", summary["conclusion"])
+
+
+class W4A16ABShellContractTests(unittest.TestCase):
+    def test_ab_shell_interleaves_restarts_and_preserves_container(self):
+        source = AB_SHELL.read_text(encoding="utf-8")
+        for token in (
+            "set +e",
+            "set -o pipefail",
+            "trap cleanup EXIT",
+            'ROUND_1=("reference" "candidate")',
+            'ROUND_2=("candidate" "reference")',
+            'ROUND_3=("reference" "candidate")',
+            "run_gemma4_dense_target_prefill_ttft.sh",
+            "2>&1 | tee",
+            "PIPESTATUS[0]",
+            "statistics.median",
+            '"target_28k_median_gain"',
+            '"target_28k_p90_no_regression"',
+            '"target_8k_median_regression"',
+            '"mtp_28k_median_no_regression"',
+            '"weight_quant_device_time_gain"',
+            "exit 0",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, source)
 
 
 if __name__ == "__main__":
