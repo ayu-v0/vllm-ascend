@@ -11,6 +11,7 @@ import torch
 from transformers import AutoConfig
 
 
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 torch_npu = pytest.importorskip("torch_npu")
 
 TARGET_MODEL_ENV = "VLLM_TEST_GEMMA4_TARGET_MODEL"

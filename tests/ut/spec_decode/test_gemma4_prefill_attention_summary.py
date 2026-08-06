@@ -181,6 +181,7 @@ class Gemma4PrefillAttentionHarnessContractTests(unittest.TestCase):
             "VLLM_TEST_GEMMA4_DRAFT_MODEL",
             "VLLM_TEST_GEMMA4_TP_SIZE",
             "VLLM_TEST_GEMMA4_NUM_SPEC_TOKENS",
+            'VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"',
             "AutoConfig.from_pretrained",
             "npu_fusion_attention",
             "test_synthetic_windowed_attention_oracle",
