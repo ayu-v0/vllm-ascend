@@ -1607,6 +1607,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             use_windowed = self._can_use_single_request_windowed_prefill(
                 attn_metadata
             )
+            if not use_windowed and self.sliding_window is not None:
+                self._log_windowed_prefill_fallback_once(attn_metadata)
         windowed_view = None
         if use_windowed:
             (
@@ -1792,6 +1794,50 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and self.value_cache is not None
             and self.key_cache.dtype in (torch.bfloat16, torch.float16)
             and self.value_cache.dtype == self.key_cache.dtype
+        )
+
+    def _log_windowed_prefill_fallback_once(
+        self,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        attn_mask = attn_metadata.attn_mask
+        model_config = getattr(self.vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        logger.info_once(
+            "Gemma4 windowed prefill attention fallback: "
+            "attn_state=%s num_decodes=%s num_prefills=%s "
+            "is_draft_model=%s model_type=%s singlecard=%s "
+            "enable_c8_quant=%s sliding_window=%s "
+            "seq_lens_count=%s actual_q_count=%s causal=%s "
+            "model_runner_type=%s attn_mask_dtype=%s "
+            "attn_mask_shape=%s mm_prefix_range=%s "
+            "key_cache_dtype=%s value_cache_dtype=%s",
+            attn_metadata.attn_state,
+            attn_metadata.num_decodes,
+            attn_metadata.num_prefills,
+            _EXTRA_CTX.is_draft_model,
+            getattr(text_config, "model_type", None),
+            self._can_use_singlecard_compact_paged_kv(),
+            self.enable_c8_quant,
+            self.sliding_window,
+            (
+                None
+                if attn_metadata.seq_lens_list is None
+                else len(attn_metadata.seq_lens_list)
+            ),
+            (
+                None
+                if attn_metadata.actual_seq_lengths_q is None
+                else len(attn_metadata.actual_seq_lengths_q)
+            ),
+            attn_metadata.causal,
+            attn_metadata.model_runner_type,
+            getattr(attn_mask, "dtype", None),
+            getattr(attn_mask, "shape", None),
+            getattr(attn_metadata, "mm_prefix_range", None),
+            getattr(self.key_cache, "dtype", None),
+            getattr(self.value_cache, "dtype", None),
         )
 
     def _get_single_request_windowed_prefill_kv(

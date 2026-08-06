@@ -154,6 +154,38 @@ class Gemma4PrefillAttentionSourceContractTests(unittest.TestCase):
         )
         self.assertIn("_assert_windowed_prefill_oracle_equal", source)
 
+    def test_windowed_fallback_diagnostics_cover_guard_inputs(self):
+        source = ATTENTION_SOURCE.read_text(encoding="utf-8")
+        if "def _log_windowed_prefill_fallback_once" not in source:
+            self.fail("windowed fallback diagnostic method is missing")
+        forward_source = _class_method_source(
+            "AscendAttentionBackendImpl",
+            "_forward_large_head_prefill_attention",
+        )
+        diagnostic_source = _class_method_source(
+            "AscendAttentionBackendImpl",
+            "_log_windowed_prefill_fallback_once",
+        )
+
+        self.assertIn(
+            "_log_windowed_prefill_fallback_once",
+            forward_source,
+        )
+        for token in (
+            "logger.info_once",
+            "Gemma4 windowed prefill attention fallback",
+            "attn_state",
+            "num_decodes",
+            "num_prefills",
+            "model_type",
+            "attn_mask_dtype",
+            "attn_mask_shape",
+            "key_cache_dtype",
+            "value_cache_dtype",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, diagnostic_source)
+
 
 if __name__ == "__main__":
     unittest.main()
