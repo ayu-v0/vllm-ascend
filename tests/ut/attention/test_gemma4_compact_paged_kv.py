@@ -96,9 +96,9 @@ def _make_windowed_attention_case(monkeypatch, *, attention_impl):
         model_runner_type="generate",
     )
     monkeypatch.setattr(
-        attention_v1._EXTRA_CTX,
-        "is_draft_model",
-        False,
+        attention_v1,
+        "_EXTRA_CTX",
+        SimpleNamespace(is_draft_model=False),
     )
     query = torch.zeros(4, 2, 3, dtype=torch.float16)
     output = torch.empty_like(query)
