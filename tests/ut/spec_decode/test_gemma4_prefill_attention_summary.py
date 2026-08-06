@@ -149,6 +149,67 @@ class Gemma4PrefillAttentionSummaryTests(unittest.TestCase):
                 {"reports": [report("windowed", "candidate")]},
             )
 
+    def test_ab_comparison_ignores_profiler_output_directory(self):
+        module = _load_module()
+
+        def report(attention_impl, profile_dir, total_device_us):
+            return {
+                "mode": "target",
+                "execution": "compiled",
+                "prompt_tokens": 28672,
+                "attention_us": 800.0,
+                "kv_gather_us": 200.0,
+                "attention_plus_gather_us": 1000.0,
+                "total_device_us": total_device_us,
+                "weight_quant_us": 3000.0,
+                "weight_quant_count": 100,
+                "manifest": {
+                    "target_model": "target",
+                    "draft_model": None,
+                    "mode": "target",
+                    "execution": "compiled",
+                    "tensor_parallel_size": 1,
+                    "num_speculative_tokens": 0,
+                    "prompt_tokens": 28672,
+                    "profile_prompt_sha256": "prompt",
+                    "w4a16_linear_impl": "reference",
+                    "vllm_ascend_enable_nz": 1,
+                    "gemma4_prefill_attention_impl": attention_impl,
+                    "engine": {"max_num_batched_tokens": 8192},
+                    "sampling": {"max_tokens": 1},
+                    "profiler": {
+                        "active_iterations": 5,
+                        "torch_profiler_dir": profile_dir,
+                    },
+                },
+            }
+
+        try:
+            comparison = module.build_ab_comparison(
+                {
+                    "reports": [
+                        report(
+                            "reference",
+                            "/profiles/reference",
+                            5000.0,
+                        )
+                    ]
+                },
+                {
+                    "reports": [
+                        report(
+                            "windowed",
+                            "/profiles/windowed",
+                            4800.0,
+                        )
+                    ]
+                },
+            )
+        except ValueError as error:
+            self.fail(str(error))
+
+        self.assertEqual(len(comparison["cases"]), 1)
+
 
 class Gemma4PrefillAttentionHarnessContractTests(unittest.TestCase):
     def test_ab_shell_interleaves_modes_and_preserves_container(self):

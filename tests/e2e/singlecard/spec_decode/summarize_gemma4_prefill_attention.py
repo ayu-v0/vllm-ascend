@@ -39,6 +39,17 @@ COMPARABLE_MANIFEST_FIELDS = (
 )
 
 
+def _comparable_manifest_value(
+    manifest: dict[str, object],
+    field: str,
+) -> object:
+    value = manifest.get(field)
+    if field == "profiler" and isinstance(value, dict):
+        value = dict(value)
+        value.pop("torch_profiler_dir", None)
+    return value
+
+
 def _number(row: dict[str, str], *keys: str) -> float:
     for key in keys:
         raw = row.get(key, "").strip().strip('"')
@@ -242,7 +253,8 @@ def _validate_ab_case_manifests(
     mismatches = [
         field
         for field in COMPARABLE_MANIFEST_FIELDS
-        if reference_manifest.get(field) != windowed_manifest.get(field)
+        if _comparable_manifest_value(reference_manifest, field)
+        != _comparable_manifest_value(windowed_manifest, field)
     ]
     if mismatches:
         raise ValueError(
