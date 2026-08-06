@@ -82,6 +82,27 @@ GraphParamKind = Literal["paged_attention", "fia"]
 logger = init_logger(__name__)
 _GEMMA4_MTP_DEBUG = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_DEBUG
 _GEMMA4_MTP_ORACLE = envs_ascend.VLLM_ASCEND_GEMMA4_MTP_ORACLE
+_VALID_GEMMA4_PREFILL_ATTENTION_IMPLS = {
+    "oracle",
+    "reference",
+    "windowed",
+}
+_GEMMA4_SPLITFUSE_CAUSAL_MASK_SHAPE = (2048, 2048)
+_GEMMA4_PREFILL_ORACLE_ATOL = 2e-2
+_GEMMA4_PREFILL_ORACLE_RTOL = 2e-2
+
+
+def _normalize_gemma4_prefill_attention_impl(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in _VALID_GEMMA4_PREFILL_ATTENTION_IMPLS:
+        expected = ", ".join(
+            sorted(_VALID_GEMMA4_PREFILL_ATTENTION_IMPLS)
+        )
+        raise ValueError(
+            "Unsupported Gemma4 prefill attention impl "
+            f"{value!r}; expected one of: {expected}"
+        )
+    return normalized
 
 
 def _debug_shape(value: object) -> tuple[int, ...] | None:
@@ -250,6 +271,51 @@ class CompactPagedKVMetadata:
     source_block_table_stride: tuple[int, ...]
     source_block_table_dtype: torch.dtype
     source_block_table_device: torch.device
+
+
+@dataclass(frozen=True)
+class SingleRequestSlidingKVView:
+    """A zero-copy tail view of compact physical slots."""
+
+    physical_slots: torch.Tensor
+    actual_seq_lengths_kv: list[int]
+    window_start: int
+    full_kv_tokens: int
+    windowed_kv_tokens: int
+    kv_tokens_saved: int
+
+
+def _select_single_request_sliding_kv_view(
+    physical_slots: torch.Tensor,
+    *,
+    seq_len: int,
+    query_len: int,
+    sliding_window: int,
+) -> SingleRequestSlidingKVView:
+    if query_len <= 0:
+        raise ValueError("query_len must be positive")
+    if sliding_window <= 0:
+        raise ValueError("sliding_window must be positive")
+    if seq_len < query_len:
+        raise ValueError("seq_len must be >= query_len")
+    if physical_slots.numel() != seq_len:
+        raise ValueError(
+            "single-request compact slot count must equal seq_len: "
+            f"slots={physical_slots.numel()} seq_len={seq_len}"
+        )
+
+    history_len = seq_len - query_len
+    window_start = max(0, history_len - sliding_window)
+    windowed_slots = physical_slots[window_start:seq_len]
+    windowed_kv_tokens = seq_len - window_start
+    return SingleRequestSlidingKVView(
+        physical_slots=windowed_slots,
+        actual_seq_lengths_kv=[windowed_kv_tokens],
+        window_start=window_start,
+        full_kv_tokens=seq_len,
+        windowed_kv_tokens=windowed_kv_tokens,
+        kv_tokens_saved=window_start,
+    )
 
 
 def _build_compact_paged_kv_metadata(
@@ -617,6 +683,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.hidden_size = self.num_heads * self.head_size
         self.kv_cache_dtype = kv_cache_dtype
         self.sliding_window = sliding_window
+        self.gemma4_prefill_attention_impl = (
+            _normalize_gemma4_prefill_attention_impl(
+                envs_ascend.VLLM_ASCEND_GEMMA4_PREFILL_ATTENTION_IMPL
+            )
+        )
+        self._gemma4_prefill_attention_stats = {
+            "reference_attention_calls": 0,
+            "windowed_attention_calls": 0,
+            "windowed_oracle_comparisons": 0,
+            "full_kv_tokens": 0,
+            "windowed_kv_tokens": 0,
+            "kv_tokens_saved": 0,
+        }
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32, device="npu")
         self.alibi_slopes = alibi_slopes
@@ -637,6 +716,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.layerIndex = 0
         self.enable_hamming_sparse = is_enable_hamming_sparse()
         self._layer_name: str | None = None
+
+    def get_gemma4_prefill_attention_stats(self) -> dict[str, int | str]:
+        return {
+            "gemma4_prefill_attention_impl": (
+                self.gemma4_prefill_attention_impl
+            ),
+            **self._gemma4_prefill_attention_stats,
+        }
 
     @staticmethod
     def update_graph_params(
@@ -1514,12 +1601,32 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
-        key, value, actual_seq_lengths_kv = self._get_large_head_prefill_kv(
-            key,
-            value,
-            attn_metadata,
-            num_tokens,
-        )
+        if self.gemma4_prefill_attention_impl == "reference":
+            use_windowed = False
+        else:
+            use_windowed = self._can_use_single_request_windowed_prefill(
+                attn_metadata
+            )
+        windowed_view = None
+        if use_windowed:
+            (
+                selected_key,
+                selected_value,
+                actual_seq_lengths_kv,
+                windowed_view,
+            ) = self._get_single_request_windowed_prefill_kv(
+                attn_metadata,
+                num_tokens,
+            )
+        else:
+            selected_key, selected_value, actual_seq_lengths_kv = (
+                self._get_large_head_prefill_kv(
+                    key,
+                    value,
+                    attn_metadata,
+                    num_tokens,
+                )
+            )
         if _GEMMA4_MTP_DEBUG and self.kv_sharing_target_layer_name is not None:
             logger.warning(
                 "Gemma4 MTP debug: shared_kv_prefill dense_kv "
@@ -1529,13 +1636,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 getattr(self, "_layer_name", None),
                 self.kv_sharing_target_layer_name,
                 _debug_shape(query),
-                _debug_shape(key),
-                _debug_shape(value),
+                _debug_shape(selected_key),
+                _debug_shape(selected_value),
                 attn_metadata.actual_seq_lengths_q,
                 actual_seq_lengths_kv,
                 _debug_preview(attn_metadata.seq_lens_list),
-                _debug_finite_summary(key),
-                _debug_finite_summary(value),
+                _debug_finite_summary(selected_key),
+                _debug_finite_summary(selected_value),
             )
         sparse_mode = 4 if self.sliding_window is not None else 3 if attn_metadata.causal else 0
         pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
@@ -1543,20 +1650,72 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_mask = attn_metadata.attn_mask
         if attn_mask is not None and attn_mask.dtype not in (torch.bool, torch.uint8):
             attn_mask = attn_mask.bool()
-        attn_output = torch_npu.npu_fusion_attention(
-            query=query,
-            key=key,
-            value=value,
-            head_num=self.num_heads,
-            input_layout="TND",
-            atten_mask=attn_mask,
-            scale=self.scale,
-            pre_tockens=pre_tokens,
-            next_tockens=next_tokens,
-            actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
-            actual_seq_kvlen=actual_seq_lengths_kv,
-            sparse_mode=sparse_mode,
-        )[0]
+        if (
+            use_windowed
+            and self.gemma4_prefill_attention_impl == "oracle"
+        ):
+            reference_key, reference_value, reference_seq_lens = (
+                self._get_large_head_prefill_kv(
+                    key,
+                    value,
+                    attn_metadata,
+                    num_tokens,
+                )
+            )
+            reference_output = self._run_large_head_prefill_attention(
+                query=query,
+                key=reference_key,
+                value=reference_value,
+                attn_mask=attn_mask,
+                actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_kv=reference_seq_lens,
+                sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=next_tokens,
+            )
+            attn_output = self._run_large_head_prefill_attention(
+                query=query,
+                key=selected_key,
+                value=selected_value,
+                attn_mask=attn_mask,
+                actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=next_tokens,
+            )
+            self._gemma4_prefill_attention_stats[
+                "reference_attention_calls"
+            ] += 1
+            self._gemma4_prefill_attention_stats[
+                "windowed_oracle_comparisons"
+            ] += 1
+            assert windowed_view is not None
+            self._assert_windowed_prefill_oracle_equal(
+                reference_output,
+                attn_output,
+                attn_metadata,
+                windowed_view,
+            )
+        else:
+            attn_output = self._run_large_head_prefill_attention(
+                query=query,
+                key=selected_key,
+                value=selected_value,
+                attn_mask=attn_mask,
+                actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=next_tokens,
+            )
+            if (
+                not use_windowed
+                and self.gemma4_prefill_attention_impl != "reference"
+            ):
+                self._gemma4_prefill_attention_stats[
+                    "reference_attention_calls"
+                ] += 1
         if _GEMMA4_MTP_DEBUG and self.kv_sharing_target_layer_name is not None:
             logger.warning(
                 "Gemma4 MTP debug: shared_kv_prefill output "
@@ -1569,6 +1728,208 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
         output[:num_tokens] = attn_output[:num_tokens]
         return output
+
+    def _run_large_head_prefill_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        actual_seq_lengths_q: list[int],
+        actual_seq_lengths_kv: list[int],
+        sparse_mode: int,
+        pre_tokens: int,
+        next_tokens: int,
+    ) -> torch.Tensor:
+        return torch_npu.npu_fusion_attention(
+            query=query,
+            key=key,
+            value=value,
+            head_num=self.num_heads,
+            input_layout="TND",
+            atten_mask=attn_mask,
+            scale=self.scale,
+            pre_tockens=pre_tokens,
+            next_tockens=next_tokens,
+            actual_seq_qlen=actual_seq_lengths_q,
+            actual_seq_kvlen=actual_seq_lengths_kv,
+            sparse_mode=sparse_mode,
+        )[0]
+
+    def _can_use_single_request_windowed_prefill(
+        self,
+        attn_metadata: AscendMetadata,
+    ) -> bool:
+        attn_mask = attn_metadata.attn_mask
+        model_config = getattr(self.vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        model_type = getattr(text_config, "model_type", None)
+        return (
+            self.gemma4_prefill_attention_impl != "reference"
+            and not _EXTRA_CTX.is_draft_model
+            and model_type in {"gemma4", "gemma4_text"}
+            and self._can_use_singlecard_compact_paged_kv()
+            and not self.enable_c8_quant
+            and self.sliding_window is not None
+            and attn_metadata.attn_state
+            == AscendAttentionState.ChunkedPrefill
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_prefills == 1
+            and attn_metadata.seq_lens_list is not None
+            and len(attn_metadata.seq_lens_list) == 1
+            and attn_metadata.actual_seq_lengths_q is not None
+            and len(attn_metadata.actual_seq_lengths_q) == 1
+            and attn_metadata.causal
+            and attn_metadata.model_runner_type == "generate"
+            and attn_mask is not None
+            and attn_mask.dtype == torch.int8
+            and tuple(attn_mask.shape)
+            == _GEMMA4_SPLITFUSE_CAUSAL_MASK_SHAPE
+            and getattr(attn_metadata, "mm_prefix_range", None) is None
+            and self.key_cache is not None
+            and self.value_cache is not None
+            and self.key_cache.dtype in (torch.bfloat16, torch.float16)
+            and self.value_cache.dtype == self.key_cache.dtype
+        )
+
+    def _get_single_request_windowed_prefill_kv(
+        self,
+        attn_metadata: AscendMetadata,
+        num_tokens: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        list[int],
+        SingleRequestSlidingKVView,
+    ]:
+        if self.key_cache is None or self.value_cache is None:
+            raise RuntimeError(
+                "Windowed prefill requires initialized Key/Value cache"
+            )
+        self._validate_compact_paged_kv_cache(
+            self.key_cache,
+            self.value_cache,
+            attn_metadata,
+        )
+        compact = self._get_or_build_compact_paged_kv_metadata(
+            attn_metadata,
+            self.key_cache,
+        )
+        seq_len = attn_metadata.seq_lens_list[0]
+        query_len = attn_metadata.actual_seq_lengths_q[0]
+        if query_len != num_tokens:
+            raise ValueError(
+                "single-request query length must equal num_tokens: "
+                f"query_len={query_len} num_tokens={num_tokens}"
+            )
+        assert self.sliding_window is not None
+        view = _select_single_request_sliding_kv_view(
+            compact.physical_slots,
+            seq_len=seq_len,
+            query_len=query_len,
+            sliding_window=self.sliding_window,
+        )
+        flat_key_cache = self.key_cache.view(
+            -1,
+            self.num_kv_heads,
+            self.head_size,
+        )
+        flat_value_cache = self.value_cache.view(
+            -1,
+            self.num_kv_heads,
+            self.head_size,
+        )
+        dense_key = flat_key_cache.index_select(0, view.physical_slots)
+        dense_value = flat_value_cache.index_select(
+            0,
+            view.physical_slots,
+        )
+        stats = self._gemma4_prefill_attention_stats
+        stats["windowed_attention_calls"] += 1
+        stats["full_kv_tokens"] += view.full_kv_tokens
+        stats["windowed_kv_tokens"] += view.windowed_kv_tokens
+        stats["kv_tokens_saved"] += view.kv_tokens_saved
+        if stats["windowed_attention_calls"] == 1:
+            logger.info(
+                "Gemma4 windowed prefill attention enabled: "
+                "layer=%s seq_len=%d query_len=%d sliding_window=%d "
+                "full_kv_tokens=%d windowed_kv_tokens=%d "
+                "kv_tokens_saved=%d impl=%s",
+                self._layer_name,
+                seq_len,
+                query_len,
+                self.sliding_window,
+                view.full_kv_tokens,
+                view.windowed_kv_tokens,
+                view.kv_tokens_saved,
+                self.gemma4_prefill_attention_impl,
+            )
+        return (
+            dense_key,
+            dense_value,
+            view.actual_seq_lengths_kv,
+            view,
+        )
+
+    def _assert_windowed_prefill_oracle_equal(
+        self,
+        reference: torch.Tensor,
+        windowed: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        view: SingleRequestSlidingKVView,
+    ) -> None:
+        context = (
+            f"layer={self._layer_name} "
+            f"sliding_window={self.sliding_window} "
+            f"seq_len={attn_metadata.seq_lens_list[0]} "
+            f"query_len={attn_metadata.actual_seq_lengths_q[0]} "
+            f"window_start={view.window_start} "
+            f"full_kv_tokens={view.full_kv_tokens} "
+            f"windowed_kv_tokens={view.windowed_kv_tokens}"
+        )
+        if (
+            reference.shape != windowed.shape
+            or reference.dtype != windowed.dtype
+            or reference.device != windowed.device
+        ):
+            raise RuntimeError(
+                "Gemma4 windowed prefill oracle metadata mismatch: "
+                f"{context} reference_shape={tuple(reference.shape)} "
+                f"windowed_shape={tuple(windowed.shape)} "
+                f"reference_dtype={reference.dtype} "
+                f"windowed_dtype={windowed.dtype} "
+                f"reference_device={reference.device} "
+                f"windowed_device={windowed.device}"
+            )
+        finite = torch.isfinite(reference).all() & torch.isfinite(
+            windowed
+        ).all()
+        close = torch.isclose(
+            reference,
+            windowed,
+            atol=_GEMMA4_PREFILL_ORACLE_ATOL,
+            rtol=_GEMMA4_PREFILL_ORACLE_RTOL,
+            equal_nan=False,
+        ).all()
+        if bool((finite & close).item()):
+            logger.info(
+                "Gemma4 windowed prefill oracle passed: %s",
+                context,
+            )
+            return
+
+        abs_error = torch.abs(reference - windowed)
+        relative_error = abs_error / torch.clamp(
+            torch.abs(reference),
+            min=1e-12,
+        )
+        raise RuntimeError(
+            "Gemma4 windowed prefill oracle mismatch: "
+            f"{context} max_abs_error={abs_error.max().item()} "
+            f"max_rel_error={relative_error.max().item()}"
+        )
 
     def _get_large_head_prefill_kv(
         self,

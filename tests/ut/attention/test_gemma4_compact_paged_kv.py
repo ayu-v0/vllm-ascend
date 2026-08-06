@@ -10,6 +10,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
     AscendMetadata,
     _build_compact_paged_kv_metadata,
+    _select_single_request_sliding_kv_view,
 )
 
 
@@ -26,6 +27,9 @@ def _make_config(**parallel_overrides):
         parallel_config=SimpleNamespace(**parallel),
         kv_transfer_config=None,
         quant_config=None,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="gemma4_text"),
+        ),
     )
 
 
@@ -35,6 +39,7 @@ def _make_impl(
     num_kv_heads=2,
     head_size=3,
     sliding_window=1024,
+    attention_impl="reference",
     **parallel_overrides,
 ):
     config = _make_config(**parallel_overrides)
@@ -42,6 +47,11 @@ def _make_impl(
         attention_v1,
         "get_current_vllm_config",
         lambda: config,
+    )
+    monkeypatch.setattr(
+        attention_v1.envs_ascend,
+        "VLLM_ASCEND_GEMMA4_PREFILL_ATTENTION_IMPL",
+        attention_impl,
     )
     impl = AscendAttentionBackendImpl(
         num_heads=num_kv_heads,
@@ -57,6 +67,42 @@ def _make_impl(
     )
     impl._layer_name = "language_model.model.layers.0.self_attn.attn"
     return impl
+
+
+def _make_windowed_attention_case(monkeypatch, *, attention_impl):
+    impl = _make_impl(
+        monkeypatch,
+        sliding_window=4,
+        attention_impl=attention_impl,
+    )
+    block_size = 2
+    impl.key_cache = torch.arange(
+        8 * block_size * 2 * 3,
+        dtype=torch.float16,
+    ).reshape(8, block_size, 2, 3)
+    impl.value_cache = impl.key_cache + 1000
+    metadata = AscendMetadata(
+        block_tables=torch.tensor(
+            [[0, 1, 2, 3, 4, 5]],
+            dtype=torch.int32,
+        ),
+        seq_lens_list=[12],
+        actual_seq_lengths_q=[4],
+        attn_mask=torch.zeros(2048, 2048, dtype=torch.int8),
+        attn_state=attention_v1.AscendAttentionState.ChunkedPrefill,
+        num_decodes=0,
+        num_prefills=1,
+        causal=True,
+        model_runner_type="generate",
+    )
+    monkeypatch.setattr(
+        attention_v1._EXTRA_CTX,
+        "is_draft_model",
+        False,
+    )
+    query = torch.zeros(4, 2, 3, dtype=torch.float16)
+    output = torch.empty_like(query)
+    return impl, metadata, query, output
 
 
 def _make_direct_gather_case(monkeypatch):
@@ -95,6 +141,260 @@ def test_build_compact_slots_sequence_major_across_blocks():
     assert result.block_table_snapshot.tolist() == [[3, 1], [2, 0]]
     assert result.block_table_snapshot.is_contiguous()
     assert result.block_table_snapshot.data_ptr() != block_table.data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "query_len", "window", "expected_start"),
+    [
+        (1023, 1023, 1024, 0),
+        (1024, 1024, 1024, 0),
+        (1025, 1, 1024, 0),
+        (1026, 1, 1024, 1),
+        (8192, 8192, 1024, 0),
+        (8193, 1, 1024, 7168),
+        (16384, 8192, 1024, 7168),
+        (28672, 8192, 1024, 19456),
+    ],
+)
+def test_windowed_slots_keep_query_and_visible_history(
+    seq_len,
+    query_len,
+    window,
+    expected_start,
+):
+    slots = torch.arange(seq_len, dtype=torch.long)
+
+    view = _select_single_request_sliding_kv_view(
+        slots,
+        seq_len=seq_len,
+        query_len=query_len,
+        sliding_window=window,
+    )
+
+    assert view.window_start == expected_start
+    assert view.actual_seq_lengths_kv == [seq_len - expected_start]
+    assert view.kv_tokens_saved == expected_start
+    assert view.physical_slots.tolist() == list(
+        range(expected_start, seq_len)
+    )
+    assert (
+        view.physical_slots.untyped_storage().data_ptr()
+        == slots.untyped_storage().data_ptr()
+    )
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "query_len", "window", "error"),
+    [
+        (8, 9, 4, "seq_len must be >= query_len"),
+        (8, 0, 4, "query_len must be positive"),
+        (8, 4, 0, "sliding_window must be positive"),
+    ],
+)
+def test_windowed_slots_reject_invalid_lengths(
+    seq_len,
+    query_len,
+    window,
+    error,
+):
+    with pytest.raises(ValueError, match=error):
+        _select_single_request_sliding_kv_view(
+            torch.arange(8),
+            seq_len=seq_len,
+            query_len=query_len,
+            sliding_window=window,
+        )
+
+
+def test_windowed_slots_reject_non_single_request_slot_count():
+    with pytest.raises(
+        ValueError,
+        match="slot count must equal seq_len",
+    ):
+        _select_single_request_sliding_kv_view(
+            torch.arange(9),
+            seq_len=8,
+            query_len=4,
+            sliding_window=4,
+        )
+
+
+def test_windowed_guard_accepts_only_supported_single_request(monkeypatch):
+    impl, metadata, _, _ = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="windowed",
+    )
+
+    assert impl._can_use_single_request_windowed_prefill(metadata)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_decodes", 1),
+        ("num_prefills", 2),
+        ("causal", False),
+        ("model_runner_type", "pooling"),
+        ("mm_prefix_range", [(0, 8)]),
+    ],
+)
+def test_windowed_guard_rejects_unsupported_metadata(
+    monkeypatch,
+    field,
+    value,
+):
+    impl, metadata, _, _ = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="windowed",
+    )
+    setattr(metadata, field, value)
+
+    assert not impl._can_use_single_request_windowed_prefill(metadata)
+
+
+def test_windowed_guard_rejects_non_gemma4_model(monkeypatch):
+    impl, metadata, _, _ = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="windowed",
+    )
+    impl.vllm_config.model_config.hf_config.model_type = "llama"
+
+    assert not impl._can_use_single_request_windowed_prefill(metadata)
+
+
+def test_reference_mode_never_selects_windowed_slots(monkeypatch):
+    impl, metadata, query, output = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="reference",
+    )
+    selected = Mock(
+        side_effect=AssertionError("windowed selection must not run")
+    )
+    monkeypatch.setattr(
+        impl,
+        "_get_single_request_windowed_prefill_kv",
+        selected,
+    )
+    monkeypatch.setattr(
+        attention_v1.torch_npu,
+        "npu_fusion_attention",
+        lambda **kwargs: (kwargs["query"].clone(), None),
+    )
+
+    impl._forward_large_head_prefill_attention(
+        query,
+        query,
+        query,
+        metadata,
+        output,
+    )
+
+    selected.assert_not_called()
+    assert impl.get_gemma4_prefill_attention_stats()[
+        "reference_attention_calls"
+    ] == 0
+
+
+def test_windowed_attention_uses_tail_kv_lengths(monkeypatch):
+    impl, metadata, query, output = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="windowed",
+    )
+    calls = []
+
+    def fake_attention(**kwargs):
+        calls.append(kwargs)
+        return kwargs["query"].clone(), None
+
+    monkeypatch.setattr(
+        attention_v1.torch_npu,
+        "npu_fusion_attention",
+        fake_attention,
+    )
+
+    impl._forward_large_head_prefill_attention(
+        query,
+        query,
+        query,
+        metadata,
+        output,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["actual_seq_qlen"] == [4]
+    assert calls[0]["actual_seq_kvlen"] == [8]
+    assert calls[0]["sparse_mode"] == 4
+    assert calls[0]["pre_tockens"] == 4
+    stats = impl.get_gemma4_prefill_attention_stats()
+    assert stats["windowed_attention_calls"] == 1
+    assert stats["full_kv_tokens"] == 12
+    assert stats["windowed_kv_tokens"] == 8
+    assert stats["kv_tokens_saved"] == 4
+
+
+def test_oracle_compares_full_and_windowed_attention(monkeypatch):
+    impl, metadata, query, output = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="oracle",
+    )
+    calls = []
+
+    def fake_attention(**kwargs):
+        calls.append(kwargs)
+        return kwargs["query"].clone(), None
+
+    monkeypatch.setattr(
+        attention_v1.torch_npu,
+        "npu_fusion_attention",
+        fake_attention,
+    )
+
+    impl._forward_large_head_prefill_attention(
+        query,
+        query,
+        query,
+        metadata,
+        output,
+    )
+
+    assert [call["actual_seq_kvlen"] for call in calls] == [[12], [8]]
+    stats = impl.get_gemma4_prefill_attention_stats()
+    assert stats["windowed_attention_calls"] == 1
+    assert stats["reference_attention_calls"] == 1
+    assert stats["windowed_oracle_comparisons"] == 1
+
+
+def test_full_attention_remains_reference_in_windowed_mode(monkeypatch):
+    impl, metadata, query, output = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="windowed",
+    )
+    impl.sliding_window = None
+    calls = []
+
+    def fake_attention(**kwargs):
+        calls.append(kwargs)
+        return kwargs["query"].clone(), None
+
+    monkeypatch.setattr(
+        attention_v1.torch_npu,
+        "npu_fusion_attention",
+        fake_attention,
+    )
+
+    impl._forward_large_head_prefill_attention(
+        query,
+        query,
+        query,
+        metadata,
+        output,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["actual_seq_kvlen"] == [12]
+    assert impl.get_gemma4_prefill_attention_stats()[
+        "windowed_attention_calls"
+    ] == 0
 
 
 def test_build_compact_slots_does_not_select_padding_sentinel():

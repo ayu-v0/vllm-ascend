@@ -96,6 +96,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # candidate: NZ weight/runtime-ready scale experiment.
     # oracle: execute both paths on the same input and return candidate output.
     "VLLM_ASCEND_W4A16_LINEAR_IMPL": lambda: os.getenv("VLLM_ASCEND_W4A16_LINEAR_IMPL", "reference"),
+    # Select the Gemma4 large-head sliding prefill attention implementation.
+    # This is not sensitive and is read when each attention method is built.
+    # reference: gather complete historical KV; windowed: retain only visible
+    # sliding-window KV; oracle: compare both paths in the same forward.
+    "VLLM_ASCEND_GEMMA4_PREFILL_ATTENTION_IMPL": lambda: os.getenv(
+        "VLLM_ASCEND_GEMMA4_PREFILL_ATTENTION_IMPL", "reference"
+    ),
     # Decide whether we should enable CP parallelism.
     "VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL", "0"))),
     # Whether to anbale dynamic EPLB
