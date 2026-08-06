@@ -252,6 +252,27 @@ def test_windowed_guard_rejects_unsupported_metadata(
     assert not impl._can_use_single_request_windowed_prefill(metadata)
 
 
+def test_windowed_fallback_log_uses_only_hashable_arguments(monkeypatch):
+    impl, metadata, _, _ = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="windowed",
+    )
+    metadata.mm_prefix_range = {0: [(0, 8)]}
+
+    def assert_hashable_arguments(message, *args):
+        assert "windowed prefill attention fallback" in message
+        for arg in args:
+            hash(arg)
+
+    monkeypatch.setattr(
+        attention_v1.logger,
+        "info_once",
+        assert_hashable_arguments,
+    )
+
+    impl._log_windowed_prefill_fallback_once(metadata)
+
+
 def test_windowed_guard_rejects_non_gemma4_model(monkeypatch):
     impl, metadata, _, _ = _make_windowed_attention_case(
         monkeypatch,

@@ -1835,7 +1835,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_metadata.model_runner_type,
             getattr(attn_mask, "dtype", None),
             getattr(attn_mask, "shape", None),
-            getattr(attn_metadata, "mm_prefix_range", None),
+            repr(getattr(attn_metadata, "mm_prefix_range", None)),
             getattr(self.key_cache, "dtype", None),
             getattr(self.value_cache, "dtype", None),
         )
