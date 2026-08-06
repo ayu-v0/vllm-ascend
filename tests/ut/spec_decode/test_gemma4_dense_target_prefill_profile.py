@@ -167,6 +167,7 @@ class ProfileRunnerContractTests(unittest.TestCase):
             profiler_kwargs={"delay_iterations": 0},
             w4a16_linear_impl="reference",
             vllm_ascend_enable_nz=1,
+            gemma4_prefill_attention_impl="windowed",
         )
 
         self.assertEqual(manifest["workload"], "gemma4_dense_target_prefill")
@@ -174,6 +175,10 @@ class ProfileRunnerContractTests(unittest.TestCase):
         self.assertEqual(manifest["offline_request_elapsed_ms"], 12.5)
         self.assertEqual(manifest["w4a16_linear_impl"], "reference")
         self.assertEqual(manifest["vllm_ascend_enable_nz"], 1)
+        self.assertEqual(
+            manifest["gemma4_prefill_attention_impl"],
+            "windowed",
+        )
         self.assertNotIn("ttft", manifest)
         self.assertNotEqual(
             manifest["warmup_prompt_sha256"],
@@ -594,8 +599,11 @@ class ShellContractTests(unittest.TestCase):
             '"case_results"',
             '"w4a16_linear_impl"',
             '"vllm_ascend_enable_nz"',
+            '"gemma4_prefill_attention_impl"',
             "W4A16_LINEAR_IMPL",
             "VLLM_ASCEND_ENABLE_NZ",
+            "PREFILL_ATTENTION_IMPL",
+            "VLLM_ASCEND_GEMMA4_PREFILL_ATTENTION_IMPL",
             "server-command.txt",
             "client-command.txt",
         ):
