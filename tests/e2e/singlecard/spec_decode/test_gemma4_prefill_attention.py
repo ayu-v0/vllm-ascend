@@ -204,12 +204,18 @@ def test_synthetic_windowed_attention_oracle(seq_len, query_len):
     torch.npu.empty_cache()
 
 
-def _run_model_smoke(*, draft_model: str | None) -> None:
+def _run_model_smoke(
+    *,
+    draft_model: str | None,
+    attention_impl: str,
+) -> None:
     _require_npu()
+    if attention_impl not in {"oracle", "reference", "windowed"}:
+        raise ValueError(f"Unsupported attention implementation: {attention_impl}")
     os.environ["VLLM_ASCEND_W4A16_LINEAR_IMPL"] = "reference"
     os.environ[
         "VLLM_ASCEND_GEMMA4_PREFILL_ATTENTION_IMPL"
-    ] = "oracle"
+    ] = attention_impl
     from vllm import LLM, SamplingParams
 
     target = _target_model()
@@ -265,6 +271,7 @@ def _run_model_smoke(*, draft_model: str | None) -> None:
             json.dumps(
                 {
                     "mode": "mtp" if draft_model else "target",
+                    "prefill_attention_impl": attention_impl,
                     "prompt_tokens": prompt_tokens,
                     "generated_token_count": len(generated),
                     "generated_token_ids": generated,
@@ -280,8 +287,15 @@ def _run_model_smoke(*, draft_model: str | None) -> None:
 
 
 def test_target_model_windowed_attention_smoke():
-    _run_model_smoke(draft_model=None)
+    _run_model_smoke(draft_model=None, attention_impl="oracle")
 
 
 def test_mtp_windowed_attention_smoke():
-    _run_model_smoke(draft_model=_draft_model())
+    _run_model_smoke(
+        draft_model=_draft_model(),
+        attention_impl="oracle",
+    )
+
+
+def test_target_model_reference_attention_smoke():
+    _run_model_smoke(draft_model=None, attention_impl="reference")

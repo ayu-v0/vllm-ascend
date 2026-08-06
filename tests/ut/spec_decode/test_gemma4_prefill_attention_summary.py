@@ -191,6 +191,17 @@ class Gemma4PrefillAttentionHarnessContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, source)
 
+    def test_npu_test_has_explicit_reference_rollback_smoke(self):
+        self.assertTrue(NPU_TEST.is_file())
+        source = NPU_TEST.read_text(encoding="utf-8")
+        for token in (
+            "test_target_model_reference_attention_smoke",
+            'attention_impl="reference"',
+            '"prefill_attention_impl": attention_impl',
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, source)
+
 
 if __name__ == "__main__":
     unittest.main()
