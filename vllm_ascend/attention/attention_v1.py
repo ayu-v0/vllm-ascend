@@ -1840,6 +1840,55 @@ class AscendAttentionBackendImpl(AttentionImpl):
             getattr(self.value_cache, "dtype", None),
         )
 
+    def _log_windowed_prefill_routing_once(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        attn_metadata: AscendMetadata,
+        shared_kv_prefill: bool,
+    ) -> None:
+        model_config = getattr(self.vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        model_type = getattr(text_config, "model_type", None)
+        if model_type not in {"gemma4", "gemma4_text"}:
+            return
+
+        attn_mask = attn_metadata.attn_mask
+        logger.warning_once(
+            "Gemma4 windowed prefill routing: "
+            "layer=%s impl=%s model_type=%s head_size=%s "
+            "sliding_window=%s attn_state=%s capturing=%s "
+            "large_head_fallback=%s shared_kv_prefill=%s "
+            "kv_sharing_target=%s query_shape=%s key_shape=%s "
+            "value_shape=%s key_cache_available=%s "
+            "value_cache_available=%s attn_mask_dtype=%s "
+            "attn_mask_shape=%s mm_prefix_range=%s",
+            getattr(self, "_layer_name", None),
+            self.gemma4_prefill_attention_impl,
+            model_type,
+            self.head_size,
+            self.sliding_window,
+            getattr(
+                attn_metadata.attn_state,
+                "name",
+                attn_metadata.attn_state,
+            ),
+            _EXTRA_CTX.capturing,
+            self._should_use_large_head_attention_fallback(),
+            shared_kv_prefill,
+            self.kv_sharing_target_layer_name,
+            tuple(query.shape),
+            None if key is None else tuple(key.shape),
+            None if value is None else tuple(value.shape),
+            self.key_cache is not None,
+            self.value_cache is not None,
+            getattr(attn_mask, "dtype", None),
+            None if attn_mask is None else tuple(attn_mask.shape),
+            repr(getattr(attn_metadata, "mm_prefix_range", None)),
+        )
+
     def _get_single_request_windowed_prefill_kv(
         self,
         attn_metadata: AscendMetadata,
@@ -2507,6 +2556,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and query.shape[0] == key.shape[0]
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
         )
+        if (
+            self.gemma4_prefill_attention_impl != "reference"
+            and self.sliding_window is not None
+            and attn_metadata.attn_state
+            in (
+                AscendAttentionState.PrefillNoCache,
+                AscendAttentionState.ChunkedPrefill,
+            )
+        ):
+            self._log_windowed_prefill_routing_once(
+                query,
+                key,
+                value,
+                attn_metadata,
+                shared_kv_prefill,
+            )
         if shared_kv_prefill:
             shared_cache_available = (
                 self.key_cache is not None and self.value_cache is not None

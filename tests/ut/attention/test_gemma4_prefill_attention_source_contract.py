@@ -186,6 +186,43 @@ class Gemma4PrefillAttentionSourceContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, diagnostic_source)
 
+    def test_windowed_routing_diagnostics_precede_branch_selection(self):
+        source = ATTENTION_SOURCE.read_text(encoding="utf-8")
+        if "def _log_windowed_prefill_routing_once" not in source:
+            self.fail("windowed routing diagnostic method is missing")
+        forward_source = _class_method_source(
+            "AscendAttentionBackendImpl",
+            "forward_impl",
+        )
+        diagnostic_source = _class_method_source(
+            "AscendAttentionBackendImpl",
+            "_log_windowed_prefill_routing_once",
+        )
+
+        self.assertIn(
+            "_log_windowed_prefill_routing_once",
+            forward_source,
+        )
+        self.assertLess(
+            forward_source.index("_log_windowed_prefill_routing_once"),
+            forward_source.index("if shared_kv_prefill:"),
+        )
+        for token in (
+            "logger.warning_once",
+            "head_size",
+            "large_head_fallback",
+            "shared_kv_prefill",
+            "query_shape",
+            "key_shape",
+            "attn_state",
+            "capturing",
+            "kv_sharing_target",
+            "key_cache_available",
+            "mm_prefix_range",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, diagnostic_source)
+
 
 if __name__ == "__main__":
     unittest.main()

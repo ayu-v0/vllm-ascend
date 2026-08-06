@@ -98,7 +98,7 @@ def _make_windowed_attention_case(monkeypatch, *, attention_impl):
     monkeypatch.setattr(
         attention_v1,
         "_EXTRA_CTX",
-        SimpleNamespace(is_draft_model=False),
+        SimpleNamespace(is_draft_model=False, capturing=False),
     )
     query = torch.zeros(4, 2, 3, dtype=torch.float16)
     output = torch.empty_like(query)
@@ -271,6 +271,33 @@ def test_windowed_fallback_log_uses_only_hashable_arguments(monkeypatch):
     )
 
     impl._log_windowed_prefill_fallback_once(metadata)
+
+
+def test_windowed_routing_log_uses_only_hashable_arguments(monkeypatch):
+    impl, metadata, query, _ = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="windowed",
+    )
+    metadata.mm_prefix_range = {0: [(0, 8)]}
+
+    def assert_hashable_arguments(message, *args):
+        assert "windowed prefill routing" in message
+        for arg in args:
+            hash(arg)
+
+    monkeypatch.setattr(
+        attention_v1.logger,
+        "warning_once",
+        assert_hashable_arguments,
+    )
+
+    impl._log_windowed_prefill_routing_once(
+        query,
+        query,
+        query,
+        metadata,
+        shared_kv_prefill=False,
+    )
 
 
 def test_windowed_guard_rejects_non_gemma4_model(monkeypatch):
