@@ -228,6 +228,16 @@ def test_windowed_guard_accepts_only_supported_single_request(monkeypatch):
     assert impl._can_use_single_request_windowed_prefill(metadata)
 
 
+def test_windowed_guard_accepts_empty_multimodal_prefix_mapping(monkeypatch):
+    impl, metadata, _, _ = _make_windowed_attention_case(
+        monkeypatch,
+        attention_impl="windowed",
+    )
+    metadata.mm_prefix_range = {0: []}
+
+    assert impl._can_use_single_request_windowed_prefill(metadata)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -236,6 +246,7 @@ def test_windowed_guard_accepts_only_supported_single_request(monkeypatch):
         ("causal", False),
         ("model_runner_type", "pooling"),
         ("mm_prefix_range", [(0, 8)]),
+        ("mm_prefix_range", {0: [(0, 8)]}),
     ],
 )
 def test_windowed_guard_rejects_unsupported_metadata(

@@ -105,6 +105,19 @@ def _normalize_gemma4_prefill_attention_impl(value: str) -> str:
     return normalized
 
 
+def _has_nonempty_mm_prefix_range(mm_prefix_range: object) -> bool:
+    if mm_prefix_range is None:
+        return False
+    if not isinstance(mm_prefix_range, dict):
+        return True
+    for ranges in mm_prefix_range.values():
+        if not isinstance(ranges, (list, tuple)):
+            return True
+        if ranges:
+            return True
+    return False
+
+
 def _debug_shape(value: object) -> tuple[int, ...] | None:
     if torch.is_tensor(value):
         return tuple(value.shape)
@@ -1789,7 +1802,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and attn_mask.dtype == torch.int8
             and tuple(attn_mask.shape)
             == _GEMMA4_SPLITFUSE_CAUSAL_MASK_SHAPE
-            and getattr(attn_metadata, "mm_prefix_range", None) is None
+            and not _has_nonempty_mm_prefix_range(
+                getattr(attn_metadata, "mm_prefix_range", None)
+            )
             and self.key_cache is not None
             and self.value_cache is not None
             and self.key_cache.dtype in (torch.bfloat16, torch.float16)

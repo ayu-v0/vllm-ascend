@@ -125,10 +125,28 @@ class Gemma4PrefillAttentionSourceContractTests(unittest.TestCase):
             'attn_metadata.model_runner_type == "generate"',
             'in {"gemma4", "gemma4_text"}',
             "_GEMMA4_SPLITFUSE_CAUSAL_MASK_SHAPE",
-            'getattr(attn_metadata, "mm_prefix_range", None) is None',
+            "not _has_nonempty_mm_prefix_range(",
         ):
             with self.subTest(token=token):
                 self.assertIn(token, source)
+
+    def test_multimodal_prefix_guard_is_empty_mapping_aware(self):
+        source = ATTENTION_SOURCE.read_text(encoding="utf-8")
+        if "def _has_nonempty_mm_prefix_range" not in source:
+            self.fail("multimodal prefix helper is missing")
+        helper_source = _module_function_source(
+            "_has_nonempty_mm_prefix_range"
+        )
+
+        for token in (
+            "mm_prefix_range is None",
+            "isinstance(mm_prefix_range, dict)",
+            "mm_prefix_range.values()",
+            "return True",
+            "return False",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, helper_source)
 
     def test_reference_windowed_and_oracle_are_explicit(self):
         source = _class_method_source(
