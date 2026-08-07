@@ -227,15 +227,24 @@ class Gemma4PrefillAttentionSourceContractTests(unittest.TestCase):
         )
         for token in (
             "logger.warning_once",
+            "windowed_guard",
             "head_size",
             "large_head_fallback",
             "shared_kv_prefill",
             "query_shape",
             "key_shape",
             "attn_state",
+            "num_decodes",
+            "num_prefills",
+            "seq_lens_count",
+            "actual_q_count",
+            "causal",
+            "model_runner_type",
             "capturing",
             "kv_sharing_target",
             "key_cache_available",
+            "key_cache_dtype",
+            "value_cache_dtype",
             "mm_prefix_range",
         ):
             with self.subTest(token=token):

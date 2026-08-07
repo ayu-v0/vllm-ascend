@@ -1871,14 +1871,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return
 
         attn_mask = attn_metadata.attn_mask
+        windowed_guard = self._can_use_single_request_windowed_prefill(
+            attn_metadata
+        )
         logger.warning_once(
             "Gemma4 windowed prefill routing: "
             "layer=%s impl=%s model_type=%s head_size=%s "
-            "sliding_window=%s attn_state=%s capturing=%s "
+            "sliding_window=%s attn_state=%s windowed_guard=%s "
+            "num_decodes=%s num_prefills=%s seq_lens_count=%s "
+            "actual_q_count=%s causal=%s model_runner_type=%s "
+            "capturing=%s "
             "large_head_fallback=%s shared_kv_prefill=%s "
             "kv_sharing_target=%s query_shape=%s key_shape=%s "
             "value_shape=%s key_cache_available=%s "
-            "value_cache_available=%s attn_mask_dtype=%s "
+            "value_cache_available=%s key_cache_dtype=%s "
+            "value_cache_dtype=%s attn_mask_dtype=%s "
             "attn_mask_shape=%s mm_prefix_range=%s",
             getattr(self, "_layer_name", None),
             self.gemma4_prefill_attention_impl,
@@ -1890,6 +1897,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 "name",
                 attn_metadata.attn_state,
             ),
+            windowed_guard,
+            attn_metadata.num_decodes,
+            attn_metadata.num_prefills,
+            (
+                None
+                if attn_metadata.seq_lens_list is None
+                else len(attn_metadata.seq_lens_list)
+            ),
+            (
+                None
+                if attn_metadata.actual_seq_lengths_q is None
+                else len(attn_metadata.actual_seq_lengths_q)
+            ),
+            attn_metadata.causal,
+            attn_metadata.model_runner_type,
             _EXTRA_CTX.capturing,
             self._should_use_large_head_attention_fallback(),
             shared_kv_prefill,
@@ -1899,6 +1921,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             None if value is None else tuple(value.shape),
             self.key_cache is not None,
             self.value_cache is not None,
+            getattr(self.key_cache, "dtype", None),
+            getattr(self.value_cache, "dtype", None),
             getattr(attn_mask, "dtype", None),
             None if attn_mask is None else tuple(attn_mask.shape),
             repr(getattr(attn_metadata, "mm_prefix_range", None)),
