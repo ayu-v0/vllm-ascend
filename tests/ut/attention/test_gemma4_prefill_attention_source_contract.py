@@ -250,6 +250,31 @@ class Gemma4PrefillAttentionSourceContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, diagnostic_source)
 
+    def test_oracle_success_evidence_uses_warning_level(self):
+        selection_source = _class_method_source(
+            "AscendAttentionBackendImpl",
+            "_get_single_request_windowed_prefill_kv",
+        )
+        oracle_source = _class_method_source(
+            "AscendAttentionBackendImpl",
+            "_assert_windowed_prefill_oracle_equal",
+        )
+
+        self.assertIn(
+            'self.gemma4_prefill_attention_impl == "oracle"',
+            selection_source,
+        )
+        self.assertIn("logger.warning", selection_source)
+        self.assertIn(
+            "Gemma4 windowed prefill attention enabled",
+            selection_source,
+        )
+        self.assertIn("logger.warning", oracle_source)
+        self.assertIn(
+            "Gemma4 windowed prefill oracle passed",
+            oracle_source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1986,7 +1986,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         stats["windowed_kv_tokens"] += view.windowed_kv_tokens
         stats["kv_tokens_saved"] += view.kv_tokens_saved
         if stats["windowed_attention_calls"] == 1:
-            logger.info(
+            log_enabled = (
+                logger.warning
+                if self.gemma4_prefill_attention_impl == "oracle"
+                else logger.info
+            )
+            log_enabled(
                 "Gemma4 windowed prefill attention enabled: "
                 "layer=%s seq_len=%d query_len=%d sliding_window=%d "
                 "full_kv_tokens=%d windowed_kv_tokens=%d "
@@ -2048,7 +2053,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             equal_nan=False,
         ).all()
         if bool((finite & close).item()):
-            logger.info(
+            logger.warning(
                 "Gemma4 windowed prefill oracle passed: %s",
                 context,
             )
