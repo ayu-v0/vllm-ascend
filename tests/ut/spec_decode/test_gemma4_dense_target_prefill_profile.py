@@ -47,6 +47,7 @@ def _args(**overrides) -> argparse.Namespace:
         "tp": 1,
         "k": 0,
         "prompt_tokens": 8192,
+        "output_tokens": 1,
         "max_model_len": 32768,
         "max_num_batched_tokens": 8192,
         "gpu_memory_utilization": 0.92,
@@ -124,6 +125,16 @@ class ProfileRunnerContractTests(unittest.TestCase):
                 _args(prompt_tokens=32768, max_model_len=32768)
             )
 
+    def test_validate_args_rejects_prompt_plus_configured_output_overflow(self):
+        with self.assertRaisesRegex(ValueError, "max_model_len"):
+            self.module.validate_args(
+                _args(
+                    prompt_tokens=32760,
+                    output_tokens=8,
+                    max_model_len=32767,
+                )
+            )
+
     def test_validate_args_requires_draft_for_mtp(self):
         with self.assertRaisesRegex(ValueError, "draft_model"):
             self.module.validate_args(_args(mode="mtp", k=3))
@@ -147,6 +158,12 @@ class ProfileRunnerContractTests(unittest.TestCase):
                         _args(gpu_memory_utilization=value)
                     )
 
+    def test_validate_args_rejects_invalid_output_tokens(self):
+        for value in (0, -1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "output_tokens"):
+                    self.module.validate_args(_args(output_tokens=value))
+
     def test_validate_args_accepts_target_and_mtp_contracts(self):
         self.module.validate_args(_args())
         self.module.validate_args(_args(gpu_memory_utilization=0.85))
@@ -165,6 +182,16 @@ class ProfileRunnerContractTests(unittest.TestCase):
         )
 
         self.assertEqual(args.gpu_memory_utilization, 0.85)
+
+    def test_parse_args_output_tokens_default(self):
+        args = _parse_cli(self.module)
+
+        self.assertEqual(args.output_tokens, 1)
+
+    def test_parse_args_output_tokens_override(self):
+        args = _parse_cli(self.module, "--output-tokens", "8")
+
+        self.assertEqual(args.output_tokens, 8)
 
     def test_profiler_kwargs_capture_prefill_from_first_iteration(self):
         compiled = self.module.build_profiler_kwargs(
@@ -255,6 +282,38 @@ class ProfileRunnerContractTests(unittest.TestCase):
             manifest["warmup_prompt_sha256"],
             manifest["profile_prompt_sha256"],
         )
+
+    def test_manifest_records_configured_output_tokens(self):
+        args = _args(output_tokens=8)
+        output_token_ids = list(range(8))
+        manifest = self.module.build_manifest(
+            args=args,
+            repo_root=Path("repo"),
+            repo_sha="abc",
+            imported_file=Path("repo/vllm_ascend/__init__.py"),
+            profile_dir=Path("profile"),
+            warmup_ids=[2, 11, 12],
+            profile_ids=[2, 21, 22],
+            output_token_ids=output_token_ids,
+            offline_request_elapsed_ms=12.5,
+            engine_args={"enable_prefix_caching": False},
+            profiler_kwargs={"delay_iterations": 0},
+            w4a16_linear_impl="reference",
+            vllm_ascend_enable_nz=1,
+            gemma4_prefill_attention_impl="oracle",
+        )
+
+        self.assertEqual(manifest["generated_token_count"], 8)
+        self.assertEqual(manifest["sampling"]["max_tokens"], 8)
+        self.assertEqual(manifest["sampling"]["min_tokens"], 8)
+
+    def test_validate_generated_token_count_uses_configured_value(self):
+        self.module.validate_generated_token_count(list(range(8)), 8)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "expected=8 actual=7",
+        ):
+            self.module.validate_generated_token_count(list(range(7)), 8)
 
 
 def _write_synthetic_profile(report_dir: Path) -> None:

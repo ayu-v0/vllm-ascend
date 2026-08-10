@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.92
+DEFAULT_OUTPUT_TOKENS = 1
 
 
 def build_exact_prompt_ids(
@@ -64,10 +65,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"max_model_len must be positive, got {args.max_model_len}"
         )
-    if args.prompt_tokens + 1 > args.max_model_len:
+    if args.output_tokens <= 0:
         raise ValueError(
-            "prompt_tokens plus one output token exceeds max_model_len: "
+            f"output_tokens must be positive, got {args.output_tokens}"
+        )
+    if args.prompt_tokens + args.output_tokens > args.max_model_len:
+        raise ValueError(
+            "prompt_tokens plus output_tokens exceeds max_model_len: "
             f"prompt_tokens={args.prompt_tokens} "
+            f"output_tokens={args.output_tokens} "
             f"max_model_len={args.max_model_len}"
         )
     if args.max_num_batched_tokens <= 0:
@@ -178,6 +184,18 @@ def _token_ids_sha256(token_ids: list[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def validate_generated_token_count(
+    token_ids: list[int],
+    expected: int,
+) -> None:
+    actual = len(token_ids)
+    if actual != expected:
+        raise RuntimeError(
+            "Profile request generated unexpected token count: "
+            f"expected={expected} actual={actual}"
+        )
+
+
 def build_manifest(
     *,
     args: argparse.Namespace,
@@ -222,8 +240,8 @@ def build_manifest(
         "engine": engine_args,
         "sampling": {
             "temperature": 0,
-            "max_tokens": 1,
-            "min_tokens": 1,
+            "max_tokens": args.output_tokens,
+            "min_tokens": args.output_tokens,
             "seed": 0,
             "ignore_eos": True,
         },
@@ -244,6 +262,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tp", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--prompt-tokens", type=int, required=True)
+    parser.add_argument(
+        "--output-tokens",
+        type=int,
+        default=DEFAULT_OUTPUT_TOKENS,
+    )
     parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument("--max-num-batched-tokens", type=int, required=True)
     parser.add_argument(
@@ -296,6 +319,7 @@ def main() -> None:
     print(f"Mode: {args.mode}", flush=True)
     print(f"Execution: {args.execution}", flush=True)
     print(f"Prompt tokens: {args.prompt_tokens}", flush=True)
+    print(f"Output tokens: {args.output_tokens}", flush=True)
     print(
         f"GPU memory utilization: {args.gpu_memory_utilization}",
         flush=True,
@@ -323,8 +347,8 @@ def main() -> None:
     )
     sampling_params = SamplingParams(
         temperature=0,
-        max_tokens=1,
-        min_tokens=1,
+        max_tokens=args.output_tokens,
+        min_tokens=args.output_tokens,
         seed=0,
         ignore_eos=True,
     )
@@ -352,11 +376,7 @@ def main() -> None:
             llm.stop_profile()
 
     token_ids = list(outputs[0].outputs[0].token_ids)
-    if len(token_ids) != 1:
-        raise RuntimeError(
-            "Profile request did not generate exactly one token: "
-            f"actual={len(token_ids)}"
-        )
+    validate_generated_token_count(token_ids, args.output_tokens)
     output_token_ids_out.write_text(
         json.dumps(token_ids, indent=2),
         encoding="utf-8",
