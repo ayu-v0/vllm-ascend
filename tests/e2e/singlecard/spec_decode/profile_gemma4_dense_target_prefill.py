@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+DEFAULT_GPU_MEMORY_UTILIZATION = 0.92
+
+
 def build_exact_prompt_ids(
     tokenizer,
     *,
@@ -72,6 +75,11 @@ def validate_args(args: argparse.Namespace) -> None:
             "max_num_batched_tokens must be positive, got "
             f"{args.max_num_batched_tokens}"
         )
+    if not 0 < args.gpu_memory_utilization <= 1:
+        raise ValueError(
+            "gpu_memory_utilization must be in (0, 1], got "
+            f"{args.gpu_memory_utilization}"
+        )
     if args.mode == "target" and args.k != 0:
         raise ValueError(f"k must be 0 for target mode, got {args.k}")
     if args.mode == "mtp":
@@ -117,7 +125,7 @@ def build_engine_args(
         "distributed_executor_backend": "uni",
         "max_model_len": args.max_model_len,
         "max_num_batched_tokens": args.max_num_batched_tokens,
-        "gpu_memory_utilization": 0.92,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
         "enable_prefix_caching": False,
         "enable_chunked_prefill": True,
         "language_model_only": True,
@@ -145,7 +153,7 @@ def build_engine_manifest(args: argparse.Namespace) -> dict[str, object]:
         "distributed_executor_backend": "uni",
         "max_model_len": args.max_model_len,
         "max_num_batched_tokens": args.max_num_batched_tokens,
-        "gpu_memory_utilization": 0.92,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
         "enable_prefix_caching": False,
         "enable_chunked_prefill": True,
         "language_model_only": True,
@@ -238,6 +246,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-tokens", type=int, required=True)
     parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument("--max-num-batched-tokens", type=int, required=True)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=DEFAULT_GPU_MEMORY_UTILIZATION,
+    )
     parser.add_argument("--profile-dir", type=Path, required=True)
     parser.add_argument("--manifest-out", type=Path, required=True)
     parser.add_argument("--output-token-ids-out", type=Path, required=True)
@@ -283,6 +296,10 @@ def main() -> None:
     print(f"Mode: {args.mode}", flush=True)
     print(f"Execution: {args.execution}", flush=True)
     print(f"Prompt tokens: {args.prompt_tokens}", flush=True)
+    print(
+        f"GPU memory utilization: {args.gpu_memory_utilization}",
+        flush=True,
+    )
     print(f"W4A16 linear implementation: {w4a16_linear_impl}", flush=True)
     print(f"VLLM_ASCEND_ENABLE_NZ: {vllm_ascend_enable_nz}", flush=True)
     print(

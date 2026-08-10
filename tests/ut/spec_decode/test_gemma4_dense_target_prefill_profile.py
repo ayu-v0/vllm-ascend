@@ -2,9 +2,11 @@ import argparse
 import csv
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_DIR = (
@@ -47,9 +49,41 @@ def _args(**overrides) -> argparse.Namespace:
         "prompt_tokens": 8192,
         "max_model_len": 32768,
         "max_num_batched_tokens": 8192,
+        "gpu_memory_utilization": 0.92,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def _parse_cli(module, *extra_args: str) -> argparse.Namespace:
+    argv = [
+        str(PROFILE_RUNNER),
+        "--target-model",
+        "target",
+        "--mode",
+        "target",
+        "--execution",
+        "eager",
+        "--tp",
+        "1",
+        "--k",
+        "0",
+        "--prompt-tokens",
+        "8192",
+        "--max-model-len",
+        "32768",
+        "--max-num-batched-tokens",
+        "8192",
+        "--profile-dir",
+        "profile",
+        "--manifest-out",
+        "manifest.json",
+        "--output-token-ids-out",
+        "output.json",
+        *extra_args,
+    ]
+    with patch.object(sys, "argv", argv):
+        return module._parse_args()
 
 
 class ProfileRunnerContractTests(unittest.TestCase):
@@ -102,9 +136,35 @@ class ProfileRunnerContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "execution"):
             self.module.validate_args(_args(execution="graph"))
 
+    def test_validate_args_rejects_invalid_gpu_memory_utilization(self):
+        for value in (0, -0.1, 1.01):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "gpu_memory_utilization",
+                ):
+                    self.module.validate_args(
+                        _args(gpu_memory_utilization=value)
+                    )
+
     def test_validate_args_accepts_target_and_mtp_contracts(self):
         self.module.validate_args(_args())
+        self.module.validate_args(_args(gpu_memory_utilization=0.85))
         self.module.validate_args(_args(mode="mtp", draft_model="draft", k=3))
+
+    def test_parse_args_gpu_memory_utilization_default(self):
+        args = _parse_cli(self.module)
+
+        self.assertEqual(args.gpu_memory_utilization, 0.92)
+
+    def test_parse_args_gpu_memory_utilization_override(self):
+        args = _parse_cli(
+            self.module,
+            "--gpu-memory-utilization",
+            "0.85",
+        )
+
+        self.assertEqual(args.gpu_memory_utilization, 0.85)
 
     def test_profiler_kwargs_capture_prefill_from_first_iteration(self):
         compiled = self.module.build_profiler_kwargs(
@@ -133,6 +193,17 @@ class ProfileRunnerContractTests(unittest.TestCase):
         self.assertFalse(engine_args["async_scheduling"])
         self.assertFalse(engine_args["enforce_eager"])
         self.assertNotIn("speculative_config", engine_args)
+
+    def test_engine_and_manifest_use_gpu_memory_utilization(self):
+        args = _args(gpu_memory_utilization=0.85)
+        engine_args = self.module.build_engine_args(
+            args,
+            profiler_config="profiler",
+        )
+        engine_manifest = self.module.build_engine_manifest(args)
+
+        self.assertEqual(engine_args["gpu_memory_utilization"], 0.85)
+        self.assertEqual(engine_manifest["gpu_memory_utilization"], 0.85)
 
     def test_mtp_engine_args_record_only_controlled_speculation_change(self):
         args = _args(mode="mtp", draft_model="draft", k=3)
